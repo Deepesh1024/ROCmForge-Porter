@@ -1,0 +1,10 @@
+fastapi
+uvicorn[standard]
+numpy
+pydantic
+python-multipart
+pytest
+pytest-asyncio
+httpx
+openai
+groq
