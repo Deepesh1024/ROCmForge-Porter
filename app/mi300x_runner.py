@@ -7,7 +7,7 @@ Remote execution now uses the cache-first verifier.
 
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from app.config import MI300X_CONFIG_PATH
 
@@ -43,7 +43,7 @@ def is_registered() -> bool:
         return False
 
 
-def get_config() -> Dict[str, Any] | None:
+def get_config() -> Optional[Dict[str, Any]]:
     """Read the registered MI300X config, or None."""
     if not is_registered():
         return None

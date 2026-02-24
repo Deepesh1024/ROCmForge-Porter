@@ -9,7 +9,7 @@ Provides deterministic, traceable Responsible-AI artefacts:
   • human_approval    — whether human approval is required
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 # ── Attribution database ─────────────────────────────────────────
@@ -36,7 +36,7 @@ def build_reasoning_trace(
     primitive: str,
     backend: str,
     safety_score: int,
-    extra_steps: List[str] | None = None,
+    extra_steps: Optional[List[str]] = None,
 ) -> List[str]:
     """Build a step-by-step reasoning trace for audit/explainability."""
     trace = [
@@ -75,7 +75,7 @@ def build_reasoning_trace(
     return trace
 
 
-def build_attribution(template_used: str | None = None) -> List[str]:
+def build_attribution(template_used: Optional[str] = None) -> List[str]:
     """Build provenance attribution list."""
     attrs = list(_RULE_ATTRIBUTION)
     if template_used and template_used in _TEMPLATE_ATTRIBUTION:
@@ -109,7 +109,7 @@ def build_responsible_ai_bundle(
     primitive: str,
     backend: str,
     safety_result: Dict[str, Any],
-    template_used: str | None = None,
+    template_used: Optional[str] = None,
     cache_hit: bool = False,
 ) -> Dict[str, Any]:
     """

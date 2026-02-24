@@ -10,7 +10,7 @@ import shutil
 import subprocess
 import tempfile
 import os
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional, Tuple
 
 
 # ── CUDA → HIP token replacements ───────────────────────────────
@@ -101,7 +101,7 @@ def _transform_kernel_launch(line: str) -> Tuple[str, bool]:
     return line[:match.start()] + hip_call + line[match.end():], True
 
 
-def _try_real_hipify(cuda_code: str) -> Dict[str, Any] | None:
+def _try_real_hipify(cuda_code: str) -> Optional[Dict[str, Any]]:
     """
     Attempt to use the real hipify-clang binary.
     Returns result dict on success, None on failure.
