@@ -1,143 +1,139 @@
-# ROCmForge Studio — Backend
+# ROCmForge Studio – Nationals Backend v2.0
 
-**Responsible-AI CUDA → ROCm porting engine.**  
-Template-based code generation, deterministic safety analysis, CPU-reference verification, and full audit logging — zero hallucinated kernels.
+Responsible-AI CUDA-to-ROCm porting engine with hardware-adaptive execution.
 
----
+## Features
+
+| Feature | Status |
+|---------|--------|
+| Hardware detection (ROCm local / MI300X remote / CPU mock) | ✅ |
+| CPU fallback with deterministic timings | ✅ |
+| MI300X remote mock execution | ✅ |
+| Mock hipify (regex) + real hipify-clang fallback | ✅ |
+| Deterministic template-based code gen (NO LLM) | ✅ |
+| PyTorch extension parser (AT_DISPATCH) | ✅ |
+| Responsible-AI: safety_score, risk_flags, attribution, reasoning_trace | ✅ |
+| Full audit logging with provenance | ✅ |
+| Bearer token auth (`dev-token`) | ✅ |
+| Async endpoints with 30s timeout | ✅ |
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
 cd backend
 pip install -r requirements.txt
-
-# 2. Start the server
 uvicorn app.main:app --reload --port 8000
+```
 
-# 3. Run tests
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/parse` | Hipify + classify + safety analysis |
+| POST | `/generate` | Template-based ROCm code generation |
+| POST | `/verify` | Hardware-adaptive verification |
+| POST | `/verify_remote` | MI300X remote verification |
+| POST | `/parse_extension` | PyTorch extension parser |
+| POST | `/register_mi300x_droplet` | Register MI300X config |
+| GET | `/health` | Health + backend info |
+
+All POST endpoints require: `Authorization: Bearer dev-token`
+
+## curl Examples
+
+### Health Check
+```bash
+curl http://localhost:8000/health | python3 -m json.tool
+```
+
+### Parse CUDA
+```bash
+curl -X POST http://localhost:8000/parse \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"cuda_code": "__global__ void k(float* A) { cudaMalloc(&A, 1024); }"}'
+```
+
+### Generate ROCm Code
+```bash
+curl -X POST http://localhost:8000/generate \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"primitive": "gemm", "meta": {"dtype": "float", "dims": {"M": 1024, "N": 1024, "K": 1024}}}'
+```
+
+### Verify
+```bash
+curl -X POST http://localhost:8000/verify \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"rocm_code": "// test", "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 128, "N": 128, "K": 128}}}'
+```
+
+### Verify Remote (MI300X)
+```bash
+curl -X POST http://localhost:8000/verify_remote \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"rocm_code": "// test", "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 128, "N": 128, "K": 128}}}'
+```
+
+### Register MI300X Droplet
+```bash
+curl -X POST http://localhost:8000/register_mi300x_droplet \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"region": "", "size": "gpu-mi300x8-1536gb-devcloud", "image": "rocm-7-1-software", "ssh_keys": [], "backups": false, "ipv6": false, "monitoring": false, "tags": [], "user_data": "", "vpc_uuid": ""}'
+```
+
+### Parse PyTorch Extension
+```bash
+curl -X POST http://localhost:8000/parse_extension \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"extension_code": "#include <torch/extension.h>\ntorch::Tensor forward(torch::Tensor x) { return x; }"}'
+```
+
+## Testing
+
+```bash
 python -m pytest app/tests.py -v
 ```
 
----
+## Architecture
 
-## API Endpoints
-
-All endpoints require `Authorization: Bearer test-token`.
-
-### POST `/parse`
-
-Run mock hipify + CUDA primitive classification + safety analysis.
-
-```bash
-curl -s -X POST http://localhost:8000/parse \
-  -H "Authorization: Bearer test-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "cuda_code": "#include <cuda_runtime.h>\n\n__global__ void matmul(const float* A, const float* B, float* C, int M, int N, int K) {\n  __shared__ float As[16][16];\n  float sum = 0.0f;\n  int row = blockIdx.y * 16 + threadIdx.y;\n  int col = blockIdx.x * 16 + threadIdx.x;\n  C[row*N+col] = sum;\n}\n\nint main() {\n  float *dA;\n  cudaMalloc(&dA, 1024*sizeof(float));\n  matmul<<<dim3(64),dim3(16,16)>>>(dA, dA, dA, 1024, 1024, 1024);\n  cudaFree(dA);\n}"
-  }' | python -m json.tool
 ```
-
-### POST `/generate`
-
-Generate ROCm (HIP) code from templates.
-
-```bash
-curl -s -X POST http://localhost:8000/generate \
-  -H "Authorization: Bearer test-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "primitive": "gemm",
-    "meta": {"dtype": "float", "dims": {"M": 1024, "N": 1024, "K": 1024}}
-  }' | python -m json.tool
+CUDA code → hipify_runner → primitive_classifier → template_engine → safety_engine
+                                                                         ↓
+                                                              responsible_ai (scoring)
+                                                                         ↓
+                                                              verifier (CPU/ROCm/MI300X)
+                                                                         ↓
+                                                              audit_logger (JSON logs)
 ```
-
-### POST `/verify`
-
-Verify generated ROCm code via CPU reference + mock ROCm output.
-
-```bash
-curl -s -X POST http://localhost:8000/verify \
-  -H "Authorization: Bearer test-token" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "rocm_code": "// generated HIP code",
-    "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 128, "N": 128, "K": 128}}
-  }' | python -m json.tool
-```
-
-### GET `/health`
-
-```bash
-curl http://localhost:8000/health
-```
-
----
 
 ## Project Structure
 
 ```
 backend/
 ├── app/
-│   ├── __init__.py
-│   ├── main.py                 # FastAPI endpoints
-│   ├── config.py               # Constants
-│   ├── models.py               # Pydantic models
-│   ├── hipify_runner.py        # Mock hipify-clang
-│   ├── primitive_classifier.py # GEMM / reduction / elementwise
-│   ├── template_engine.py      # Deterministic code generation
-│   ├── safety_engine.py        # Responsible-AI safety layer
-│   ├── verifier.py             # CPU reference verification
-│   ├── audit_logger.py         # JSON audit logs
-│   ├── utils.py                # Helpers
-│   ├── tests.py                # Pytest suite
-│   └── sample_inputs/
-│       ├── test_gemm.cu
-│       ├── test_reduction.cu
-│       └── test_elemwise.cu
-├── templates/
-│   ├── gemm_hip_template.cpp
-│   ├── gemm_triton_template.py
-│   ├── reduction_hip_template.cpp
-│   ├── reduction_triton_template.py
-│   ├── elemwise_hip_template.cpp
-│   └── elemwise_triton_template.py
-├── audit_logs/                 # Auto-created at runtime
+│   ├── main.py               ← FastAPI (7 endpoints)
+│   ├── config.py              ← Constants + timings
+│   ├── models.py              ← Pydantic models
+│   ├── hardware_detector.py   ← rocm_local / cpu_mock / mi300x_remote
+│   ├── hipify_runner.py       ← Subprocess + mock fallback
+│   ├── primitive_classifier.py ← Regex GEMM/reduction/elementwise
+│   ├── pytorch_parser.py      ← AT_DISPATCH + kernel extraction
+│   ├── template_engine.py     ← YAML metadata + placeholder fill
+│   ├── responsible_ai.py      ← Reasoning trace + attribution
+│   ├── safety_engine.py       ← Wave64/vectorisation/LDS checks
+│   ├── verifier.py            ← Hardware-adaptive verification
+│   ├── mi300x_runner.py       ← Remote mock execution
+│   ├── audit_logger.py        ← Extended JSON audit logs
+│   ├── utils.py               ← L2 norm, helpers
+│   └── sample_inputs/         ← Test .cu files
+├── templates/                 ← HIP C++ & Triton templates
+├── audit_logs/                ← Auto-generated
 ├── requirements.txt
 └── README.md
 ```
-
----
-
-## Architecture
-
-```
-CUDA code ──► hipify_runner ──► primitive_classifier ──► template_engine
-                                                            │
-                                                    safety_engine ◄── verifier
-                                                            │
-                                                     audit_logger
-```
-
-- **No LLM code generation** — only templates produce kernels
-- **Deterministic** — same input always produces same output
-- **Responsible-AI** — wave64 awareness, vectorisation checks, attribution
-- **Auditable** — every request logged with UUID, timestamp, full I/O
-
----
-
-## Testing
-
-```bash
-# Run all tests
-python -m pytest app/tests.py -v
-
-# Run a specific test
-python -m pytest app/tests.py::test_parse_endpoint -v
-```
-
----
-
-## License
-
-MIT

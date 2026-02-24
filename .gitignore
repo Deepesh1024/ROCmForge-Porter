@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 audit_logs/
 *.egg-info/
+mi300x_config.json
 dist/
 build/
 .env

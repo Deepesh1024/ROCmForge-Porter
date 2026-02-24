@@ -1,120 +1,132 @@
 """
-ROCmForge Studio — Template Engine
+ROCmForge Studio — Template Engine (Nationals Build)
 
-Loads HIP / Triton templates from the templates/ directory and fills
-Jinja2-style placeholders:  {{ DTYPE }}, {{ DIMS }}, {{ TILE_SIZE }}, {{ BLOCK_SIZE }}
+Loads HIP C++ and Triton Python templates from the templates/ directory.
+Extracts YAML-style metadata headers from template comments.
+Fills placeholders ({{ DTYPE }}, {{ DIMS }}, etc.) deterministically.
+NEVER uses LLM for code generation.
 """
 
 import os
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List, Tuple
 
 from app.config import TEMPLATE_DIR
 
-# Map primitive → (HIP template, Triton template)
-_TEMPLATE_MAP: Dict[str, Dict[str, str]] = {
-    "gemm": {
-        "hip":    "gemm_hip_template.cpp",
-        "triton": "gemm_triton_template.py",
-    },
-    "reduction": {
-        "hip":    "reduction_hip_template.cpp",
-        "triton": "reduction_triton_template.py",
-    },
-    "elementwise": {
-        "hip":    "elemwise_hip_template.cpp",
-        "triton": "elemwise_triton_template.py",
-    },
+# ── Template filename map ────────────────────────────────────────
+
+_TEMPLATE_MAP: Dict[str, str] = {
+    "gemm":        "gemm_hip_template.cpp",
+    "reduction":   "reduction_hip_template.cpp",
+    "elementwise": "elemwise_hip_template.cpp",
 }
 
-# Default placeholder values
-_DEFAULTS: Dict[str, str] = {
-    "DTYPE":      "float",
-    "DIMS":       "1024",
-    "TILE_SIZE":  "16",
-    "BLOCK_SIZE": "256",
+_TRITON_TEMPLATE_MAP: Dict[str, str] = {
+    "gemm":        "gemm_triton_template.py",
+    "reduction":   "reduction_triton_template.py",
+    "elementwise": "elemwise_triton_template.py",
 }
 
-# Dtype → C++ type mapping
-_DTYPE_CPP: Dict[str, str] = {
+# ── Placeholder defaults ─────────────────────────────────────────
+
+_DTYPE_MAP = {
     "float":  "float",
     "double": "double",
     "half":   "__half",
     "int":    "int",
 }
 
-# Dtype → Triton type mapping
-_DTYPE_TRITON: Dict[str, str] = {
+_TRITON_DTYPE_MAP = {
     "float":  "tl.float32",
     "double": "tl.float64",
     "half":   "tl.float16",
-    "int":    "tl.int32",
 }
 
 
-def _load_template(filename: str) -> str:
-    """Read a template file from disk."""
-    path = os.path.join(TEMPLATE_DIR, filename)
-    if not os.path.isfile(path):
-        raise FileNotFoundError(f"Template not found: {path}")
-    with open(path, "r") as f:
-        return f.read()
+def _extract_metadata(template_text: str) -> Dict[str, str]:
+    """
+    Extract YAML-style metadata from the template header comment block.
+
+    Looks for lines like:
+        * Primitive: GEMM
+        * Source: AMD ROCm 7.2 ...
+        * Safety notes: ...
+
+    Returns dict of key→value.
+    """
+    metadata: Dict[str, str] = {}
+    header_match = re.search(r'/\*(.+?)\*/', template_text, re.DOTALL)
+    if not header_match:
+        return metadata
+
+    for line in header_match.group(1).splitlines():
+        line = line.strip().lstrip("*").strip()
+        if ":" in line and not line.startswith("Placeholders"):
+            key, _, value = line.partition(":")
+            key = key.strip().lower().replace(" ", "_")
+            value = value.strip()
+            if key and value:
+                metadata[key] = value
+
+    return metadata
 
 
-def _fill(template: str, replacements: Dict[str, str]) -> str:
-    """Replace {{ KEY }} placeholders in *template*."""
+def _fill_placeholders(template: str, meta: Dict[str, Any], dtype_map: Dict[str, str]) -> str:
+    """Replace all {{ PLACEHOLDER }} tokens."""
+    dtype = meta.get("dtype", "float")
+    dims = meta.get("dims", {})
+
+    dim_val = dims.get("M", dims.get("N", 1024))
+    tile_size = meta.get("tile_size", 16)
+    block_size = meta.get("block_size", 256)
+
+    replacements = {
+        "{{ DTYPE }}":      dtype_map.get(dtype, dtype),
+        "{{ DIMS }}":       str(dim_val),
+        "{{ TILE_SIZE }}":  str(tile_size),
+        "{{ BLOCK_SIZE }}": str(block_size),
+    }
+
     result = template
-    for key, value in replacements.items():
-        # Support both {{ KEY }} and {{KEY}}
-        result = result.replace(f"{{{{ {key} }}}}", value)
-        result = result.replace(f"{{{{{key}}}}}", value)
+    for placeholder, value in replacements.items():
+        result = result.replace(placeholder, value)
+
     return result
 
 
-def generate(primitive: str, meta: Dict[str, Any], backend: str = "hip") -> Dict[str, Any]:
+def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Generate ROCm code for the given *primitive* using templates.
+    Generate ROCm code from templates.
 
-    Parameters
-    ----------
-    primitive : str
-        "gemm", "reduction", or "elementwise"
-    meta : dict
-        Must contain at least "dtype".  May contain "dims".
-    backend : str
-        "hip" (default) or "triton".
-
-    Returns
-    -------
-    dict
-        rocm_code     : str — generated source code
-        template_used : str — filename of the template used
+    Returns dict with:
+        rocm_code      — filled HIP C++ template
+        triton_code    — filled Triton Python template (if available)
+        template_used  — filename of the HIP template
+        metadata       — extracted template metadata dict
     """
-    if primitive not in _TEMPLATE_MAP:
-        raise ValueError(f"Unknown primitive: {primitive}")
+    # HIP template
+    hip_filename = _TEMPLATE_MAP.get(primitive, _TEMPLATE_MAP["elementwise"])
+    hip_path = os.path.join(TEMPLATE_DIR, hip_filename)
 
-    if backend not in _TEMPLATE_MAP[primitive]:
-        raise ValueError(f"No {backend} template for primitive: {primitive}")
+    with open(hip_path) as f:
+        hip_template = f.read()
 
-    template_file = _TEMPLATE_MAP[primitive][backend]
-    template_src  = _load_template(template_file)
+    metadata = _extract_metadata(hip_template)
+    rocm_code = _fill_placeholders(hip_template, meta, _DTYPE_MAP)
 
-    dtype_raw = meta.get("dtype", "float")
-    dims      = meta.get("dims", {})
-
-    # Build replacement map
-    is_triton = backend == "triton"
-    dtype_mapped = (_DTYPE_TRITON if is_triton else _DTYPE_CPP).get(dtype_raw, dtype_raw)
-
-    replacements: Dict[str, str] = {
-        "DTYPE":      dtype_mapped,
-        "DIMS":       str(dims.get("M", dims.get("N", _DEFAULTS["DIMS"]))),
-        "TILE_SIZE":  str(meta.get("tile_size", _DEFAULTS["TILE_SIZE"])),
-        "BLOCK_SIZE": str(meta.get("block_size", _DEFAULTS["BLOCK_SIZE"])),
-    }
-
-    rocm_code = _fill(template_src, replacements)
+    # Triton template (optional)
+    triton_code = None
+    triton_filename = _TRITON_TEMPLATE_MAP.get(primitive)
+    if triton_filename:
+        triton_path = os.path.join(TEMPLATE_DIR, triton_filename)
+        if os.path.isfile(triton_path):
+            with open(triton_path) as f:
+                triton_template = f.read()
+            triton_code = _fill_placeholders(triton_template, meta, _TRITON_DTYPE_MAP)
 
     return {
         "rocm_code":     rocm_code,
-        "template_used": template_file,
+        "triton_code":   triton_code,
+        "template_used": hip_filename,
+        "metadata":      metadata,
     }

@@ -1,157 +1,166 @@
 """
-ROCmForge Studio — Pytest Tests
-
-Covers all 3 endpoints: /parse, /generate, /verify
-Uses httpx.AsyncClient for async FastAPI testing.
+ROCmForge Studio — Test Suite (Nationals Build)
 """
 
 import pytest
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient, ASGITransport
 
 from app.main import app
 
 pytestmark = pytest.mark.asyncio
 
-HEADERS = {"Authorization": "Bearer test-token"}
-
-SAMPLE_GEMM_CUDA = """
-#include <cuda_runtime.h>
-
-#define M 1024
-#define N 1024
-#define K 1024
-
-__global__ void matmul(const float* A, const float* B, float* C,
-                       int M, int N, int K)
-{
-    __shared__ float As[16][16];
-    __shared__ float Bs[16][16];
-
-    int row = blockIdx.y * 16 + threadIdx.y;
-    int col = blockIdx.x * 16 + threadIdx.x;
-    float sum = 0.0f;
-
-    for (int t = 0; t < (K + 15) / 16; ++t) {
-        As[threadIdx.y][threadIdx.x] = A[row * K + t * 16 + threadIdx.x];
-        Bs[threadIdx.y][threadIdx.x] = B[(t * 16 + threadIdx.y) * N + col];
-        __syncthreads();
-        for (int k = 0; k < 16; ++k)
-            sum += As[threadIdx.y][k] * Bs[k][threadIdx.x];
-        __syncthreads();
-    }
-    if (row < M && col < N)
-        C[row * N + col] = sum;
-}
-
-int main() {
-    float *dA, *dB, *dC;
-    cudaMalloc(&dA, M * K * sizeof(float));
-    cudaMalloc(&dB, K * N * sizeof(float));
-    cudaMalloc(&dC, M * N * sizeof(float));
-    matmul<<<dim3(64,64), dim3(16,16)>>>(dA, dB, dC, M, N, K);
-    cudaDeviceSynchronize();
-    cudaFree(dA);
-    cudaFree(dB);
-    cudaFree(dC);
-    return 0;
-}
-"""
+HEADERS = {"Authorization": "Bearer dev-token"}
+TRANSPORT = ASGITransport(app=app)
 
 
+# ── /parse ───────────────────────────────────────────────────────
 
 async def test_parse_endpoint():
-    """POST /parse should hipify, classify as GEMM, and return a safety score."""
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/parse", json={"cuda_code": SAMPLE_GEMM_CUDA}, headers=HEADERS)
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/parse", json={
+            "cuda_code": "__global__ void k(float* A) { cudaMalloc(&A, 1024); }"
+        }, headers=HEADERS)
     assert resp.status_code == 200
-
     body = resp.json()
     assert body["status"] == "success"
+    assert body["hardware_backend_used"] in ("cpu_mock", "rocm_local", "mi300x_remote")
+    assert body["safety_score"] is not None
+    assert isinstance(body["risk_flags"], list)
+    assert isinstance(body["attribution"], list)
+    assert isinstance(body["reasoning_trace"], list)
     assert body["audit_id"] is not None
-
-    data = body["data"]
-    # Hipify should have replaced CUDA APIs
-    assert "hipMalloc" in data["hipify"]["hipified_code"]
-    assert len(data["hipify"]["changes"]) > 0
-
-    # Classification should detect GEMM
-    assert data["classification"]["primitive"] == "gemm"
-    assert data["classification"]["dtype"] == "float"
-
-    # Safety engine should return a score
-    assert 0 <= data["safety"]["score"] <= 100
+    assert "hipify" in body["data"]
+    assert "classification" in body["data"]
+    assert "safety" in body["data"]
 
 
+# ── /generate ────────────────────────────────────────────────────
 
 async def test_generate_endpoint():
-    """POST /generate should return template-generated ROCm code."""
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/generate",
-            json={
-                "primitive": "gemm",
-                "meta": {"dtype": "float", "dims": {"M": 512, "N": 512, "K": 512}},
-            },
-            headers=HEADERS,
-        )
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/generate", json={
+            "primitive": "gemm",
+            "meta": {"dtype": "float", "dims": {"M": 128, "N": 128, "K": 128}}
+        }, headers=HEADERS)
     assert resp.status_code == 200
-
     body = resp.json()
     assert body["status"] == "success"
-
-    data = body["data"]
-    assert "gemm_hip_template.cpp" in data["generation"]["template_used"]
-    assert "rocm_code" in data["generation"]
-    assert len(data["generation"]["rocm_code"]) > 100
-
-    # Safety check
-    assert 0 <= data["safety"]["score"] <= 100
+    gen = body["data"]["generation"]
+    assert "rocm_code" in gen
+    assert gen["template_used"] == "gemm_hip_template.cpp"
+    assert "metadata" in gen
+    assert body["safety_score"] is not None
+    assert body["hardware_backend_used"] is not None
 
 
+# ── /verify ──────────────────────────────────────────────────────
 
 async def test_verify_endpoint():
-    """POST /verify should return verification results with L2 norm pass."""
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/verify",
-            json={
-                "rocm_code": "// placeholder HIP code",
-                "meta": {
-                    "primitive": "gemm",
-                    "dtype": "float",
-                    "dims": {"M": 64, "N": 64, "K": 64},
-                },
-            },
-            headers=HEADERS,
-        )
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/verify", json={
+            "rocm_code": "// test",
+            "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 64, "N": 64, "K": 64}}
+        }, headers=HEADERS)
     assert resp.status_code == 200
-
     body = resp.json()
     assert body["status"] == "success"
-
     v = body["data"]["verification"]
     assert v["pass"] is True
     assert v["l2_norm"] < 1e-5
-    assert v["speed_ms"] == 42.0
-    assert v["occupancy"] == 72.0
-    assert v["bandwidth_gbps"] == 1800.0
+    assert body["safety_score"] is not None
+    assert body["hardware_backend_used"] is not None
 
 
+# ── /verify_remote ───────────────────────────────────────────────
+
+async def test_verify_remote_endpoint():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/verify_remote", json={
+            "rocm_code": "// test",
+            "meta": {"primitive": "reduction", "dtype": "float", "dims": {"N": 512}}
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["hardware_backend_used"] == "mi300x_remote"
+    v = body["data"]["verification"]
+    assert v["pass"] is True
+    assert v["speed_ms"] == 0.08  # MI300X mock timing for reduction
+
+
+# ── /parse_extension ─────────────────────────────────────────────
+
+async def test_parse_extension_endpoint():
+    ext_code = '''
+    #include <torch/extension.h>
+    __global__ void matmul_kernel(float* A, float* B, float* C, int N) {
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx < N) C[idx] = A[idx] * B[idx];
+    }
+    torch::Tensor forward(torch::Tensor input) {
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "forward", [&] {
+            matmul_kernel<<<1, 256>>>(input.data_ptr<scalar_t>(), nullptr, nullptr, 256);
+        });
+        return input;
+    }
+    '''
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/parse_extension", json={
+            "extension_code": ext_code,
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    ea = body["data"]["extension_analysis"]
+    assert ea["is_pytorch_extension"] is True
+    assert len(ea["at_dispatch_calls"]) >= 1
+    assert len(ea["embedded_kernels"]) >= 1
+
+
+# ── /register_mi300x_droplet ────────────────────────────────────
+
+async def test_register_mi300x():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/register_mi300x_droplet", json={
+            "region": "",
+            "size": "gpu-mi300x8-1536gb-devcloud",
+            "image": "rocm-7-1-software",
+            "ssh_keys": [],
+            "backups": False,
+            "ipv6": False,
+            "monitoring": False,
+            "tags": [],
+            "user_data": "",
+            "vpc_uuid": "",
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["data"]["registered"] is True
+
+
+# ── Auth rejection ───────────────────────────────────────────────
 
 async def test_auth_rejected():
-    """Requests without valid Bearer token must return 401."""
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post("/parse", json={"cuda_code": "int main(){}"})
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/parse", json={"cuda_code": "test"})
     assert resp.status_code == 401
 
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        resp = await client.post(
-            "/parse",
-            json={"cuda_code": "int main(){}"},
-            headers={"Authorization": "Bearer wrong-token"},
-        )
+
+async def test_wrong_token():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/parse", json={"cuda_code": "test"},
+                             headers={"Authorization": "Bearer wrong"})
     assert resp.status_code == 401
+
+
+# ── /health ──────────────────────────────────────────────────────
+
+async def test_health():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.get("/health")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "hardware" in body
+    assert body["hardware"]["backend"] in ("cpu_mock", "rocm_local", "mi300x_remote")

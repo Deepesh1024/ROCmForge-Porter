@@ -1,24 +1,21 @@
 """
-ROCmForge Studio — Mock Hipify Runner v2.0
+ROCmForge Studio — Hipify Runner (Nationals Build)
 
-Simulates hipify-clang by performing regex-based CUDA → HIP API
-replacements.  Real hipify-clang is NOT required.
-
-v2.0 improvements:
-  • Correct kernel launch <<<>>> → hipLaunchKernelGGL transformation
-  • Extended API coverage (60+ tokens, cuDNN/cuFFT/cuRAND/cuSPARSE headers)
-  • Proper handling of kernel<<<grid,block,shared,stream>>>(args)
-  • Deduplicated change log
+Tries real hipify-clang subprocess first.
+Falls back to safe mock hipify (regex) if not found.
 """
 
 import re
+import shutil
+import subprocess
+import tempfile
+import os
 from typing import Dict, List, Any, Tuple
 
-# ── CUDA → HIP simple token replacements ─────────────────────────
-# Applied via word-boundary regex on each line.
+
+# ── CUDA → HIP token replacements ───────────────────────────────
 
 _TOKEN_REPLACEMENTS: List[Tuple[str, str]] = [
-    # Memory management
     ("cudaMalloc",              "hipMalloc"),
     ("cudaMallocManaged",       "hipMallocManaged"),
     ("cudaFree",                "hipFree"),
@@ -29,8 +26,6 @@ _TOKEN_REPLACEMENTS: List[Tuple[str, str]] = [
     ("cudaMemcpyDeviceToDevice","hipMemcpyDeviceToDevice"),
     ("cudaMemset",              "hipMemset"),
     ("cudaMemsetAsync",         "hipMemsetAsync"),
-
-    # Streams & events
     ("cudaStream_t",            "hipStream_t"),
     ("cudaStreamCreate",        "hipStreamCreate"),
     ("cudaStreamSynchronize",   "hipStreamSynchronize"),
@@ -42,8 +37,6 @@ _TOKEN_REPLACEMENTS: List[Tuple[str, str]] = [
     ("cudaEventSynchronize",    "hipEventSynchronize"),
     ("cudaEventElapsedTime",    "hipEventElapsedTime"),
     ("cudaEventDestroy",        "hipEventDestroy"),
-
-    # Device management
     ("cudaDeviceSynchronize",   "hipDeviceSynchronize"),
     ("cudaSetDevice",           "hipSetDevice"),
     ("cudaGetDevice",           "hipGetDevice"),
@@ -51,15 +44,11 @@ _TOKEN_REPLACEMENTS: List[Tuple[str, str]] = [
     ("cudaGetDeviceProperties", "hipGetDeviceProperties"),
     ("cudaDeviceReset",         "hipDeviceReset"),
     ("cudaDeviceProp",          "hipDeviceProp_t"),
-
-    # Error handling
     ("cudaError_t",             "hipError_t"),
     ("cudaSuccess",             "hipSuccess"),
     ("cudaGetLastError",        "hipGetLastError"),
     ("cudaGetErrorString",      "hipGetErrorString"),
     ("cudaPeekAtLastError",     "hipPeekAtLastError"),
-
-    # BLAS
     ("cublasSgemm",             "rocblas_sgemm"),
     ("cublasDgemm",             "rocblas_dgemm"),
     ("cublasHgemm",             "rocblas_hgemm"),
@@ -67,13 +56,9 @@ _TOKEN_REPLACEMENTS: List[Tuple[str, str]] = [
     ("cublasDestroy",           "rocblas_destroy_handle"),
     ("cublasHandle_t",          "rocblas_handle"),
     ("cublasSetStream",         "rocblas_set_stream"),
-
-    # Texture / Surface
     ("cudaCreateTextureObject", "hipCreateTextureObject"),
     ("cudaDestroyTextureObject","hipDestroyTextureObject"),
 ]
-
-# ── Header replacements  ─────────────────────────────────────────
 
 _HEADER_REPLACEMENTS: List[Tuple[str, str]] = [
     (r'#include\s*<cuda_runtime\.h>',      '#include <hip/hip_runtime.h>'),
@@ -88,114 +73,111 @@ _HEADER_REPLACEMENTS: List[Tuple[str, str]] = [
     (r'#include\s*<cudnn\.h>',              '#include <miopen/miopen.h>'),
 ]
 
-# ── Kernel launch regex  ─────────────────────────────────────────
-# Matches:  kernelName<<<grid, block>>>(args)
-# And:      kernelName<<<grid, block, sharedMem>>>(args)
-# And:      kernelName<<<grid, block, sharedMem, stream>>>(args)
-#
-# Correct HIP form:
-#   hipLaunchKernelGGL(kernelName, grid, block, sharedMem, stream, args)
-
 _KERNEL_LAUNCH_RE = re.compile(
-    r'(\w+)'                    # 1: kernel name
-    r'\s*<<<\s*'                # <<<
-    r'([^,>]+)'                 # 2: grid dim
-    r'\s*,\s*'                  # ,
-    r'([^,>]+)'                 # 3: block dim
-    r'(?:\s*,\s*([^,>]+))?'     # 4: optional shared mem
-    r'(?:\s*,\s*([^>]+))?'      # 5: optional stream
-    r'\s*>>>\s*'                # >>>
-    r'\(([^)]*)\)'              # 6: (args)
+    r'(\w+)'
+    r'\s*<<<\s*'
+    r'([^,>]+)'
+    r'\s*,\s*'
+    r'([^,>]+)'
+    r'(?:\s*,\s*([^,>]+))?'
+    r'(?:\s*,\s*([^>]+))?'
+    r'\s*>>>\s*'
+    r'\(([^)]*)\)'
 )
 
 
 def _transform_kernel_launch(line: str) -> Tuple[str, bool]:
-    """
-    Transform  kernel<<<grid, block>>>(args)
-    into       hipLaunchKernelGGL(kernel, grid, block, sharedMem, stream, args)
-    """
+    """Transform <<<>>> to hipLaunchKernelGGL."""
     match = _KERNEL_LAUNCH_RE.search(line)
     if not match:
         return line, False
-
     kernel = match.group(1).strip()
     grid   = match.group(2).strip()
     block  = match.group(3).strip()
     shared = (match.group(4) or "0").strip()
     stream = (match.group(5) or "0").strip()
     args   = match.group(6).strip()
-
-    # Build proper hipLaunchKernelGGL call
     hip_call = f"hipLaunchKernelGGL({kernel}, {grid}, {block}, {shared}, {stream}, {args})"
-
-    # Preserve indentation
-    indent = line[:match.start()]
-    trailing = line[match.end():]
-    new_line = indent + hip_call + trailing
-
-    return new_line, True
+    return line[:match.start()] + hip_call + line[match.end():], True
 
 
-def run_mock_hipify(cuda_code: str) -> Dict[str, Any]:
+def _try_real_hipify(cuda_code: str) -> Dict[str, Any] | None:
     """
-    Apply mock hipify to *cuda_code*.
-
-    Returns
-    -------
-    dict
-        hipified_code : str  — transformed source
-        changes       : list[str] — deduplicated list of replacements made
+    Attempt to use the real hipify-clang binary.
+    Returns result dict on success, None on failure.
     """
+    if not shutil.which("hipify-clang"):
+        return None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".cu", mode="w", delete=False) as f:
+            f.write(cuda_code)
+            tmp_path = f.name
+        result = subprocess.run(
+            ["hipify-clang", tmp_path, "--"],
+            capture_output=True, timeout=15, text=True,
+        )
+        os.unlink(tmp_path)
+        if result.returncode == 0:
+            return {
+                "hipified_code": result.stdout,
+                "changes": ["hipify-clang applied all transformations"],
+                "method": "hipify-clang (real)",
+            }
+    except Exception:
+        pass
+    return None
+
+
+def _mock_hipify(cuda_code: str) -> Dict[str, Any]:
+    """Apply regex-based mock hipify."""
     changes: List[str] = []
     hipified_lines: List[str] = []
 
     for line in cuda_code.splitlines():
         original = line
-        changed_this_line = False
+        changed = False
 
-        # 1) Header replacements (regex-based)
         for pattern, replacement in _HEADER_REPLACEMENTS:
             new_line, n = re.subn(pattern, replacement, line)
             if n > 0:
-                # Extract the header name for a cleaner log
-                old_hdr = re.search(r'<(.+?)>', pattern)
-                new_hdr = re.search(r'<(.+?)>', replacement)
-                if old_hdr and new_hdr:
-                    changes.append(f"<{old_hdr.group(1)}> → <{new_hdr.group(1)}>")
-                else:
-                    changes.append(f"{pattern} → {replacement}")
+                old_h = re.search(r'<(.+?)>', pattern)
+                new_h = re.search(r'<(.+?)>', replacement)
+                if old_h and new_h:
+                    changes.append(f"<{old_h.group(1)}> → <{new_h.group(1)}>")
                 line = new_line
-                changed_this_line = True
+                changed = True
 
-        # 2) Kernel launch transformation (must happen BEFORE token replacement)
         line, did_launch = _transform_kernel_launch(line)
         if did_launch:
-            changes.append("<<<grid, block>>>(args) → hipLaunchKernelGGL(kernel, grid, block, sharedMem, stream, args)")
-            changed_this_line = True
+            changes.append("<<<grid, block>>>(args) → hipLaunchKernelGGL(kernel, grid, block, shared, stream, args)")
+            changed = True
 
-        # 3) Token replacements (word-boundary)
         for cuda_tok, hip_tok in _TOKEN_REPLACEMENTS:
-            pattern = rf'\b{re.escape(cuda_tok)}\b'
-            new_line, n = re.subn(pattern, hip_tok, line)
+            pat = rf'\b{re.escape(cuda_tok)}\b'
+            new_line, n = re.subn(pat, hip_tok, line)
             if n > 0:
                 changes.append(f"{cuda_tok} → {hip_tok}")
                 line = new_line
-                changed_this_line = True
+                changed = True
 
-        if changed_this_line:
-            hipified_lines.append(f"// [hipified] {line}")
-        else:
-            hipified_lines.append(line)
+        hipified_lines.append(f"// [hipified] {line}" if changed else line)
 
-    # Deduplicate changes while preserving order
     seen: set = set()
-    unique_changes: List[str] = []
-    for c in changes:
-        if c not in seen:
-            seen.add(c)
-            unique_changes.append(c)
+    unique = [c for c in changes if not (c in seen or seen.add(c))]
 
     return {
         "hipified_code": "\n".join(hipified_lines),
-        "changes": unique_changes,
+        "changes": unique,
+        "method": "mock hipify (regex)",
     }
+
+
+def run_hipify(cuda_code: str) -> Dict[str, Any]:
+    """
+    Run hipify on CUDA code.
+    Tries real hipify-clang first; falls back to mock.
+    """
+    real = _try_real_hipify(cuda_code)
+    if real is not None:
+        return real
+    return _mock_hipify(cuda_code)
