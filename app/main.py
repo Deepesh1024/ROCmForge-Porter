@@ -184,7 +184,7 @@ async def verify_endpoint(
     body: VerifyRequest,
     authorization: Optional[str] = Header(default=None),
 ):
-    """Verify generated ROCm code via CPU reference + mock device output."""
+    """Verify with real CPU timing + MI300X cache-first lookup."""
     _check_auth(authorization)
     backend = _detect()
 
@@ -196,17 +196,22 @@ async def verify_endpoint(
             timeout=TIMEOUT_SECONDS,
         )
 
+        v = result["verification"]
+        cache_hit = v.get("cache_hit", False)
+        actual_backend = v.get("hardware_backend_used", backend)
         primitive = body.meta.get("primitive", "elementwise")
         safety = result["safety"]
+
         rai = responsible_ai.build_responsible_ai_bundle(
-            "verify", primitive, backend, safety,
+            "verify", primitive, actual_backend, safety,
+            cache_hit=cache_hit,
         )
 
         audit_id = audit_logger.log(
             "verify",
             {"rocm_code": body.rocm_code[:300], "meta": body.meta},
-            result.get("verification", {}),
-            hardware_backend_used=backend,
+            v,
+            hardware_backend_used=actual_backend,
             safety_score=rai["safety_score"],
             risk_flags=rai["risk_flags"],
             attribution=rai["attribution"],
@@ -218,10 +223,11 @@ async def verify_endpoint(
             data=result,
             audit_id=audit_id,
             safety_score=rai["safety_score"],
+            execution_confidence=rai["execution_confidence"],
             risk_flags=rai["risk_flags"],
             attribution=rai["attribution"],
             reasoning_trace=rai["reasoning_trace"],
-            hardware_backend_used=backend,
+            hardware_backend_used=actual_backend,
         )
     except asyncio.TimeoutError:
         return _error_response("Operation timed out (30s)", backend)
@@ -236,10 +242,11 @@ async def verify_remote_endpoint(
     body: VerifyRequest,
     authorization: Optional[str] = Header(default=None),
 ):
-    """Verify using MI300X remote (DEV MODE: mock execution)."""
+    """Verify using MI300X cache-first, fallback to CPU."""
     _check_auth(authorization)
 
     try:
+        # Force cache lookup (same verifier, it checks cache internally)
         result = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
                 None, _do_verify, body.rocm_code, body.meta, "mi300x_remote"
@@ -247,17 +254,22 @@ async def verify_remote_endpoint(
             timeout=TIMEOUT_SECONDS,
         )
 
+        v = result["verification"]
+        cache_hit = v.get("cache_hit", False)
+        actual_backend = v.get("hardware_backend_used", "cpu_fallback")
         primitive = body.meta.get("primitive", "elementwise")
         safety = result["safety"]
+
         rai = responsible_ai.build_responsible_ai_bundle(
-            "verify", primitive, "mi300x_remote", safety,
+            "verify", primitive, actual_backend, safety,
+            cache_hit=cache_hit,
         )
 
         audit_id = audit_logger.log(
             "verify_remote",
             {"rocm_code": body.rocm_code[:300], "meta": body.meta},
-            result.get("verification", {}),
-            hardware_backend_used="mi300x_remote",
+            v,
+            hardware_backend_used=actual_backend,
             safety_score=rai["safety_score"],
             risk_flags=rai["risk_flags"],
             attribution=rai["attribution"],
@@ -269,15 +281,16 @@ async def verify_remote_endpoint(
             data=result,
             audit_id=audit_id,
             safety_score=rai["safety_score"],
+            execution_confidence=rai["execution_confidence"],
             risk_flags=rai["risk_flags"],
             attribution=rai["attribution"],
             reasoning_trace=rai["reasoning_trace"],
-            hardware_backend_used="mi300x_remote",
+            hardware_backend_used=actual_backend,
         )
     except asyncio.TimeoutError:
-        return _error_response("Operation timed out (30s)", "mi300x_remote")
+        return _error_response("Operation timed out (30s)", "cpu_fallback")
     except Exception as exc:
-        return _error_response(str(exc), "mi300x_remote")
+        return _error_response(str(exc), "cpu_fallback")
 
 
 # ── POST /parse_extension ────────────────────────────────────────

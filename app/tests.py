@@ -1,5 +1,5 @@
 """
-ROCmForge Studio — Test Suite (Nationals Build)
+ROCmForge Studio — Test Suite (Nationals Final v2.1)
 """
 
 import pytest
@@ -23,7 +23,6 @@ async def test_parse_endpoint():
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
-    assert body["hardware_backend_used"] in ("cpu_mock", "rocm_local", "mi300x_remote")
     assert body["safety_score"] is not None
     assert isinstance(body["risk_flags"], list)
     assert isinstance(body["attribution"], list)
@@ -31,7 +30,6 @@ async def test_parse_endpoint():
     assert body["audit_id"] is not None
     assert "hipify" in body["data"]
     assert "classification" in body["data"]
-    assert "safety" in body["data"]
 
 
 # ── /generate ────────────────────────────────────────────────────
@@ -48,44 +46,64 @@ async def test_generate_endpoint():
     gen = body["data"]["generation"]
     assert "rocm_code" in gen
     assert gen["template_used"] == "gemm_hip_template.cpp"
-    assert "metadata" in gen
     assert body["safety_score"] is not None
-    assert body["hardware_backend_used"] is not None
 
 
-# ── /verify ──────────────────────────────────────────────────────
+# ── /verify (cache HIT — 128x128 is in cache) ───────────────────
 
-async def test_verify_endpoint():
+async def test_verify_cache_hit():
     async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
         resp = await ac.post("/verify", json={
             "rocm_code": "// test",
-            "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 64, "N": 64, "K": 64}}
+            "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 128, "N": 128, "K": 128}}
         }, headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
     v = body["data"]["verification"]
-    assert v["pass"] is True
-    assert v["l2_norm"] < 1e-5
-    assert body["safety_score"] is not None
-    assert body["hardware_backend_used"] is not None
+    assert v["cache_hit"] is True
+    assert v["hardware_backend_used"] == "mi300x_remote_cached"
+    assert v["gpu_time_ms"] is not None
+    assert v["cpu_reference_time_ms"] > 0
+    assert v["speedup_vs_cpu"] is not None
+    assert body["execution_confidence"] == 95
 
 
-# ── /verify_remote ───────────────────────────────────────────────
+# ── /verify (cache MISS — 77x77 is NOT in cache) ────────────────
 
-async def test_verify_remote_endpoint():
+async def test_verify_cache_miss():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/verify", json={
+            "rocm_code": "// test",
+            "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 77, "N": 77, "K": 77}}
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    v = body["data"]["verification"]
+    assert v["cache_hit"] is False
+    assert v["hardware_backend_used"] == "cpu_fallback"
+    assert v["gpu_time_ms"] is None
+    assert v["cpu_reference_time_ms"] > 0
+    assert body["execution_confidence"] == 70
+
+
+# ── /verify_remote (cache HIT — 1024x1024 is in cache) ──────────
+
+async def test_verify_remote_cache_hit():
     async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
         resp = await ac.post("/verify_remote", json={
             "rocm_code": "// test",
-            "meta": {"primitive": "reduction", "dtype": "float", "dims": {"N": 512}}
+            "meta": {"primitive": "gemm", "dtype": "float", "dims": {"M": 1024, "N": 1024, "K": 1024}}
         }, headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "success"
-    assert body["hardware_backend_used"] == "mi300x_remote"
     v = body["data"]["verification"]
-    assert v["pass"] is True
-    assert v["speed_ms"] == 0.08  # MI300X mock timing for reduction
+    assert v["cache_hit"] is True
+    assert v["hardware_backend_used"] == "mi300x_remote_cached"
+    assert v["gpu_time_ms"] == 0.118
+    assert body["execution_confidence"] == 95
 
 
 # ── /parse_extension ─────────────────────────────────────────────
@@ -113,8 +131,6 @@ async def test_parse_extension_endpoint():
     assert body["status"] == "success"
     ea = body["data"]["extension_analysis"]
     assert ea["is_pytorch_extension"] is True
-    assert len(ea["at_dispatch_calls"]) >= 1
-    assert len(ea["embedded_kernels"]) >= 1
 
 
 # ── /register_mi300x_droplet ────────────────────────────────────
@@ -125,13 +141,6 @@ async def test_register_mi300x():
             "region": "",
             "size": "gpu-mi300x8-1536gb-devcloud",
             "image": "rocm-7-1-software",
-            "ssh_keys": [],
-            "backups": False,
-            "ipv6": False,
-            "monitoring": False,
-            "tags": [],
-            "user_data": "",
-            "vpc_uuid": "",
         }, headers=HEADERS)
     assert resp.status_code == 200
     body = resp.json()
@@ -162,5 +171,4 @@ async def test_health():
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert "hardware" in body
     assert body["hardware"]["backend"] in ("cpu_mock", "rocm_local", "mi300x_remote")

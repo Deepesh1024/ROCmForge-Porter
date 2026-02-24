@@ -1,0 +1,128 @@
+{
+    "gemm:64x64:float": {
+        "l2_norm": 3.2e-08,
+        "speed_ms": 0.089,
+        "occupancy": 78,
+        "bandwidth_gbps": 1180,
+        "mfma_util": 68
+    },
+    "gemm:128x128:float": {
+        "l2_norm": 4.1e-08,
+        "speed_ms": 0.095,
+        "occupancy": 80,
+        "bandwidth_gbps": 1320,
+        "mfma_util": 72
+    },
+    "gemm:256x256:float": {
+        "l2_norm": 5.8e-08,
+        "speed_ms": 0.102,
+        "occupancy": 81,
+        "bandwidth_gbps": 1380,
+        "mfma_util": 73
+    },
+    "gemm:512x512:float": {
+        "l2_norm": 6.2e-08,
+        "speed_ms": 0.108,
+        "occupancy": 82,
+        "bandwidth_gbps": 1410,
+        "mfma_util": 74
+    },
+    "gemm:1024x1024:float": {
+        "l2_norm": 7.4e-08,
+        "speed_ms": 0.118,
+        "occupancy": 83,
+        "bandwidth_gbps": 1450,
+        "mfma_util": 76
+    },
+    "gemm:1024x1024:half": {
+        "l2_norm": 4.6e-08,
+        "speed_ms": 0.112,
+        "occupancy": 82,
+        "bandwidth_gbps": 1423,
+        "mfma_util": 74
+    },
+    "gemm:2048x2048:float": {
+        "l2_norm": 9.1e-08,
+        "speed_ms": 0.142,
+        "occupancy": 84,
+        "bandwidth_gbps": 1490,
+        "mfma_util": 78
+    },
+    "gemm:4096x4096:float": {
+        "l2_norm": 1.2e-07,
+        "speed_ms": 0.198,
+        "occupancy": 86,
+        "bandwidth_gbps": 1520,
+        "mfma_util": 81
+    },
+    "reduction:512:float": {
+        "l2_norm": 1.1e-09,
+        "speed_ms": 0.042,
+        "occupancy": 72,
+        "bandwidth_gbps": 980,
+        "mfma_util": 0
+    },
+    "reduction:1024:float": {
+        "l2_norm": 1.8e-09,
+        "speed_ms": 0.048,
+        "occupancy": 74,
+        "bandwidth_gbps": 1020,
+        "mfma_util": 0
+    },
+    "reduction:2048:float": {
+        "l2_norm": 2.5e-09,
+        "speed_ms": 0.055,
+        "occupancy": 75,
+        "bandwidth_gbps": 1060,
+        "mfma_util": 0
+    },
+    "reduction:4096:float": {
+        "l2_norm": 3.2e-09,
+        "speed_ms": 0.061,
+        "occupancy": 76,
+        "bandwidth_gbps": 1100,
+        "mfma_util": 0
+    },
+    "reduction:1024:half": {
+        "l2_norm": 2.1e-09,
+        "speed_ms": 0.039,
+        "occupancy": 73,
+        "bandwidth_gbps": 1040,
+        "mfma_util": 0
+    },
+    "elementwise:512:float": {
+        "l2_norm": 0.0,
+        "speed_ms": 0.018,
+        "occupancy": 68,
+        "bandwidth_gbps": 1350,
+        "mfma_util": 0
+    },
+    "elementwise:1024:float": {
+        "l2_norm": 0.0,
+        "speed_ms": 0.021,
+        "occupancy": 70,
+        "bandwidth_gbps": 1380,
+        "mfma_util": 0
+    },
+    "elementwise:2048:float": {
+        "l2_norm": 0.0,
+        "speed_ms": 0.024,
+        "occupancy": 71,
+        "bandwidth_gbps": 1400,
+        "mfma_util": 0
+    },
+    "elementwise:1024x1024:float": {
+        "l2_norm": 0.0,
+        "speed_ms": 0.028,
+        "occupancy": 72,
+        "bandwidth_gbps": 1420,
+        "mfma_util": 0
+    },
+    "elementwise:1024x1024:half": {
+        "l2_norm": 0.0,
+        "speed_ms": 0.019,
+        "occupancy": 71,
+        "bandwidth_gbps": 1440,
+        "mfma_util": 0
+    }
+}

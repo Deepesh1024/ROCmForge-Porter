@@ -47,6 +47,7 @@ class APIResponse(BaseModel):
     audit_id: Optional[str] = None
     message: Optional[str] = None
     safety_score: Optional[int] = None
+    execution_confidence: Optional[int] = None
     risk_flags: Optional[List[str]] = None
     attribution: Optional[List[str]] = None
     reasoning_trace: Optional[List[str]] = None
