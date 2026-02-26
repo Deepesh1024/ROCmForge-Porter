@@ -119,8 +119,8 @@ def _check_general_safety(code: str) -> tuple:
 # Public API
 # ──────────────────────────────────────────────────────────────────
 
-def _check_pattern_bonus(code: str, pattern: str) -> tuple:
-    """Provide a score bonus and risk flag optimizations based on recognized patterns."""
+def _check_pattern_bonus(code: str, pattern: str, meta: dict) -> tuple:
+    """Provide a score bonus and risk flag optimizations based on recognized patterns and execution drift metrics."""
     issues: List[str] = []
     penalty = 0
 
@@ -136,8 +136,18 @@ def _check_pattern_bonus(code: str, pattern: str) -> tuple:
     elif pattern == "vectorized":
         issues.append("Pattern Bonus: Vectorized elementwise maximizes memory bus utility")
         penalty -= 5
+        
+    # Apply dynamic dimensional safety drift calculation
+    if meta and "dims" in meta:
+        dims = meta["dims"]
+        if "M" in dims and "N" in dims:
+            m, n = dims["M"], dims["N"]
+            # Alignment check: If dimensions are not aligned to typical 16/32 byte boundaries
+            if m % 16 != 0 or n % 16 != 0:
+                issues.append(f"Safety Drift Warning: Dimensions ({m}x{n}) misaligned with 16-byte boundaries. Assuming boundary guard logic liability.")
+                penalty += 8  # Scale dynamic penalty based on misalignment
 
-    flag = "PATTERN_OPTIMIZED" if penalty < 0 else None
+    flag = "PATTERN_OPTIMIZED" if penalty < 0 else "DRIFT_LIABILITY" if penalty > 0 else None
     return penalty, issues, flag
 
 def analyse(code: str, pattern: str = None, meta: dict = None) -> Dict[str, Any]:
@@ -171,7 +181,7 @@ def analyse(code: str, pattern: str = None, meta: dict = None) -> Dict[str, Any]
             risk_flags.append(flag)
 
     if pattern:
-        p_penalty, p_details, p_flag = _check_pattern_bonus(code, pattern)
+        p_penalty, p_details, p_flag = _check_pattern_bonus(code, pattern, meta)
         total_penalty += p_penalty
         all_details.extend(p_details)
         if p_flag:

@@ -1,95 +1,147 @@
 """
-ROCmForge Studio — CUDA Primitive Classifier
+ROCmForge Studio — AST-Based CUDA Primitive Classifier
 
-Deterministic, regex-based classifier that detects:
+Deterministic, tree-sitter AST classifier that detects:
   • GEMM (matmul patterns, cuBLAS calls)
   • Reduction (sum, max, atomicAdd, warp-level reductions)
   • Elementwise (pointwise / element-wise ops)
+  • Fused Matmul (GEMM + Activation)
 """
 
 import re
 from typing import Any, Dict, List, Optional
+import tree_sitter
+import tree_sitter_cpp
 
-# ── Regex pattern banks ──────────────────────────────────────────
+# Initialize parser
+parser = tree_sitter.Parser(tree_sitter.Language(tree_sitter_cpp.language()))
 
-_GEMM_PATTERNS: List[str] = [
-    r'\bmatmul\b',
-    r'\bgemm\b',
-    r'\bcublasSgemm\b',
-    r'\bcublasDgemm\b',
-    r'\bcublasHgemm\b',
-    r'\brocblas_sgemm\b',
-    r'\brocblas_dgemm\b',
-    r'\b__global__\s+void\s+matmul\b',
-    r'\bshared\s+\w+\s+\w+\s*\[',       # shared-memory tiling (heuristic)
-    r'\bfor\s*\(.*\bk\b.*\)',             # k-loop in tiled matmul (heuristic)
-]
-
-_REDUCTION_PATTERNS: List[str] = [
-    r'\batomicAdd\b',
-    r'\b__reduce_add_sync\b',
-    r'\b__shfl_down_sync\b',
-    r'\b__shfl_xor_sync\b',
-    r'\breduction\b',
-    r'\breduce\b',
-    r'\bsum\b',
-    r'\bmax\b',
-    r'\bmin\b',
-    r'\bwarpReduce\b',
-    r'\bblockReduce\b',
-]
-
-_ELEMENTWISE_PATTERNS: List[str] = [
-    r'\belementwise\b',
-    r'\bpointwise\b',
-    r'\b__global__\s+void\s+\w*(add|mul|sub|div|relu|sigmoid|tanh|scale|bias)\w*\b',
-    r'\bout\s*\[\s*idx\s*\]\s*=',        # out[idx] = … pattern
-    r'\bc\s*\[\s*i\s*\]\s*=\s*a\s*\[\s*i\s*\]',  # c[i] = a[i] …
-]
-
-# ── Data-type detection ──────────────────────────────────────────
-
-_DTYPE_PATTERNS: Dict[str, str] = {
-    r'\bhalf\b':    "half",
-    r'\b__half\b':  "half",
-    r'\bfloat16\b': "half",
-    r'\bfp16\b':    "half",
-    r'\bfloat\b':   "float",
-    r'\bfp32\b':    "float",
-    r'\bdouble\b':  "double",
-    r'\bfp64\b':    "double",
-    r'\bint\b':     "int",
-    r'\bint32_t\b': "int",
+# Fallback definitions
+_DTYPE_MAP = {
+    "half": "half", "__half": "half", "float16": "half", "fp16": "half",
+    "float": "float", "fp32": "float",
+    "double": "double", "fp64": "double",
+    "int": "int", "int32_t": "int"
 }
 
-# ── Dimension / shape extraction (best effort) ──────────────────
+def _traverse_ast(node, target_types=None, target_text=None, results=None):
+    """Recursively search AST for specific node types or source text matches."""
+    if results is None:
+        results = []
+    
+    match = True
+    if target_types and node.type not in target_types:
+        match = False
+    
+    if target_text and match:
+        # Extract source bytes if needed for text matching
+        text = node.text.decode('utf8')
+        if not re.search(target_text, text, re.IGNORECASE):
+            match = False
+            
+    if match and (target_types or target_text):
+         results.append(node)
 
-_DIM_PATTERN = re.compile(
-    r'(?:M|N|K|rows|cols|width|height|dim|size)\s*=\s*(\d+)', re.IGNORECASE
-)
+    for child in node.children:
+        _traverse_ast(child, target_types, target_text, results)
+        
+    return results
 
+def _detect_primitive_and_pattern_ast(code: str, root_node) -> tuple:
+    primitive = "elementwise"
+    pattern = "vectorized"
+    
+    # Check for library calls first
+    calls = _traverse_ast(root_node, target_types=["call_expression"])
+    for call in calls:
+        call_text = call.text.decode('utf8').lower()
+        if "cublas" in call_text or "rocblas" in call_text or "gemm" in call_text:
+            return "gemm", "tiled_shared"
+        elif "conv" in call_text or "cudnn" in call_text:
+            return "conv", "direct_conv"
+            
+    # Check memory access and syncthreads for patterns
+    shared_decls = _traverse_ast(root_node, target_text=r'\b(__shared__|shared)\b')
+    syncthreads = _traverse_ast(root_node, target_text=r'__syncthreads')
+    
+    # Check for loops (often indicates GEMM or Reduction)
+    for_loops = _traverse_ast(root_node, target_types=["for_statement"])
+    
+    # Check for atomics/shuffles (reduction)
+    shuffles = _traverse_ast(root_node, target_text=r'__shfl|warp_reduce|reduce')
+    atomics = _traverse_ast(root_node, target_text=r'atomicAdd|atomicMax')
+    
+    # Check for specific Math / Activations
+    activations = _traverse_ast(root_node, target_text=r'\brelu\b|\bsigmoid\b|>\s*0\s*\?')
+    exponents = _traverse_ast(root_node, target_text=r'\bexpf\b|\bexp\b')
+    sqrts = _traverse_ast(root_node, target_text=r'\brsqrtf\b|\bsqrt\b|\brsqrt\b')
+    rngs = _traverse_ast(root_node, target_text=r'\bseed\b|\brand\b')
+    
+    # Classify based on AST features
+    # 1. Attention (typically has exp/softmax + matrix traits)
+    if exponents and sum(1 for p in _traverse_ast(root_node, target_types=["parameter_declaration"]) if b'Q' in p.text or b'K' in p.text or b'V' in p.text) >= 2:
+        return "attention", "flash_attention"
+    
+    # 2. Softmax (typically has exp, reduce max, reduce sum)
+    elif exponents and shuffles and len(for_loops) >= 2:
+        return "softmax", "fused_softmax_reduce"
+        
+    # 3. LayerNorm (typically has rsqrt, mean/var reductions)
+    elif sqrts and len(for_loops) >= 2 and shuffles:
+        return "layernorm", "fused_layernorm"
+        
+    # 4. Conv (nested loops over kernel size)
+    elif len(for_loops) >= 4: # batch, channels, kernel_h, kernel_w
+        return "conv", "direct_conv"
+        
+    # 5. Dropout (RNG based element-wise mutator)
+    elif rngs and _traverse_ast(root_node, target_text=r'\bdrop\b'):
+        return "dropout", "fused_dropout"
+        
+    # 6. Fallback Standard Primitives
+    elif shuffles or atomics:
+        primitive = "reduction"
+        pattern = "wavefront_reduce" if shuffles else "atomic_reduce"
+    elif len(for_loops) >= 1 and (shared_decls or syncthreads or len(for_loops) >= 2):
+        if activations:
+            primitive = "fused_matmul"
+            pattern = "fused_relu"
+        else:
+            primitive = "gemm"
+            pattern = "tiled_shared" if shared_decls else "basic_gemm"
+    else:
+        # Elementwise
+        primitive = "elementwise"
+        vector_types = _traverse_ast(root_node, target_text=r'float4|float2|double2|int4')
+        pattern = "vectorized" if vector_types else "scalar"
+        
+    return primitive, pattern
 
-def _detect_dtype(code: str) -> str:
-    """Return the first matching dtype found in *code*, default 'float'."""
-    for pattern, dtype in _DTYPE_PATTERNS.items():
-        if re.search(pattern, code):
-            return dtype
-    return "float"
-
-
-def _extract_dims(code: str) -> Dict[str, int]:
-    """Best-effort extraction of named dimensions from *code*."""
-    dims: Dict[str, int] = {}
-    for m in _DIM_PATTERN.finditer(code):
+def _extract_dims_ast(code: str, root_node) -> Dict[str, int]:
+    """Extract dimensions from basic assignments or params in AST."""
+    dims = {}
+    
+    # Check for parameter declarations that look like dimensions (M, N, K, size)
+    params = _traverse_ast(root_node, target_types=["parameter_declaration"])
+    
+    # Also fallback to regex for simple assignments since AST for unresolved C++ might be messy
+    dim_pattern = re.compile(r'(?:M|N|K|rows|cols|width|height|dim|size)\s*=\s*(\d+)', re.IGNORECASE)
+    for m in dim_pattern.finditer(code):
         name = m.group(0).split("=")[0].strip().upper()
         dims[name] = int(m.group(1))
+        
     return dims
 
-
-def _score_patterns(code: str, patterns: List[str]) -> int:
-    """Count how many patterns from *patterns* match in *code*."""
-    return sum(1 for p in patterns if re.search(p, code, re.IGNORECASE))
-
+def _detect_dtype_ast(root_node) -> str:
+    """Find primary floating/integer type in AST."""
+    types = _traverse_ast(root_node, target_types=["primitive_type", "type_identifier"])
+    
+    for t in types:
+        text = t.text.decode('utf8').lower()
+        if text in _DTYPE_MAP:
+            return _DTYPE_MAP[text]
+            
+    return "float"
 
 def classify(code: str) -> Dict[str, Any]:
     """
@@ -102,25 +154,15 @@ def classify(code: str) -> Dict[str, Any]:
         dtype     : str   — detected data type
         shape     : str   — shape format (e.g. "M=1024, N=1024, K=1024")
         pattern   : str   — detected semantic pattern
-        meta      : dict  — additional metadata (dims, scores)
+        meta      : dict  — additional metadata (dims)
     """
-    gemm_score = _score_patterns(code, _GEMM_PATTERNS)
-    red_score  = _score_patterns(code, _REDUCTION_PATTERNS)
-    elem_score = _score_patterns(code, _ELEMENTWISE_PATTERNS)
-
-    scores = {"gemm": gemm_score, "reduction": red_score, "elementwise": elem_score}
-
-    # Pick the primitive with the highest score; default to elementwise
-    primitive = max(scores, key=scores.get)  # type: ignore[arg-type]
-    if all(v == 0 for v in scores.values()):
-        primitive = "elementwise"
-
-    dtype = _detect_dtype(code)
-    dims  = _extract_dims(code)
-
-    # Detect fused_matmul if gemm has a relu
-    if primitive == "gemm" and re.search(r'\brelu\b', code, re.IGNORECASE):
-        primitive = "fused_matmul"
+    # Parse code into AST
+    tree = parser.parse(bytes(code, 'utf8'))
+    root = tree.root_node
+    
+    primitive, pattern = _detect_primitive_and_pattern_ast(code, root)
+    dtype = _detect_dtype_ast(root)
+    dims = _extract_dims_ast(code, root)
 
     # Fallback dims when none detected
     if not dims:
@@ -133,26 +175,6 @@ def classify(code: str) -> Dict[str, Any]:
 
     shape = ", ".join(f"{k}={v}" for k, v in dims.items())
 
-    # Detect pattern based on primitive
-    pattern = ""
-    if primitive == "fused_matmul":
-        pattern = "fused_relu"
-    elif primitive == "gemm":
-        if re.search(r'\bshared\b|__shared__', code):
-            pattern = "tiled_shared"
-        else:
-            pattern = "tiled_shared"
-    elif primitive == "elementwise":
-        if re.search(r'float4|float2|double2|int4', code):
-            pattern = "vectorized"
-        else:
-            pattern = "vectorized"
-    elif primitive == "reduction":
-        if re.search(r'__shfl_down_sync|warpReduce', code):
-            pattern = "wavefront_reduce"
-        else:
-            pattern = "wavefront_reduce"
-
     return {
         "primitive": primitive,
         "dtype": dtype,
@@ -160,8 +182,8 @@ def classify(code: str) -> Dict[str, Any]:
         "pattern": pattern,
         "meta": {
             "dims": dims,
-            "pattern_scores": scores,
             "pattern": pattern
         },
     }
+
 

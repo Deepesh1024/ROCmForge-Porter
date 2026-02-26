@@ -11,6 +11,16 @@ from pydantic import BaseModel, Field
 class ParseRequest(BaseModel):
     cuda_code: str = Field(..., description="Raw CUDA source code to parse and classify")
 
+class FileRecord(BaseModel):
+    filename: str = Field(..., description="File path relative to workspace")
+    content: str = Field(..., description="Source code of the file")
+
+class ParseProjectRequest(BaseModel):
+    files: List[FileRecord] = Field(..., description="Array of file contents representing a CUDA project")
+
+class GenerateProjectRequest(BaseModel):
+    files: List[FileRecord] = Field(..., description="Array of file contents with analyzed metadata")
+
 
 class GenerateRequest(BaseModel):
     primitive: str = Field(..., description="Primitive type: gemm | reduction | elementwise")

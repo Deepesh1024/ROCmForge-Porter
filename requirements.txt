@@ -8,3 +8,6 @@ pytest-asyncio
 httpx
 openai
 groq
+tree-sitter
+tree-sitter-c
+tree-sitter-cpp

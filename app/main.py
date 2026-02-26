@@ -29,6 +29,8 @@ from app.models import (
     APIResponse,
     GenerateRequest,
     ParseRequest,
+    ParseProjectRequest,
+    GenerateProjectRequest,
     ParseExtensionRequest,
     RegisterMI300XRequest,
     VerifyRequest,
@@ -177,6 +179,96 @@ async def generate_endpoint(
             risk_flags=rai["risk_flags"],
             attribution=rai["attribution"],
             reasoning_trace=rai["reasoning_trace"],
+            hardware_backend_used=backend,
+        )
+    except asyncio.TimeoutError:
+        return _error_response("Operation timed out (30s)", backend)
+    except Exception as exc:
+        return _error_response(str(exc), backend)
+
+
+# ── POST /parse_project ──────────────────────────────────────────
+
+@app.post("/parse_project", response_model=APIResponse)
+async def parse_project_endpoint(
+    body: ParseProjectRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Parse multiple CUDA files into an aggregated AST map."""
+    _check_auth(authorization)
+    backend = _detect()
+
+    try:
+        def _process_project():
+            project_map = {}
+            for file_record in body.files:
+                if file_record.filename.endswith((".cu", ".cpp", ".cuh", ".h")):
+                    hipified = hipify_runner.run_hipify(file_record.content)
+                    classified = primitive_classifier.classify(file_record.content)
+                    safety = safety_engine.analyse(
+                        hipified["hipified_code"],
+                        pattern=classified.get("pattern"),
+                        meta=classified.get("meta")
+                    )
+                    project_map[file_record.filename] = {
+                        "hipify": hipified,
+                        "classification": classified,
+                        "safety": safety
+                    }
+            return project_map
+            
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _process_project),
+            timeout=TIMEOUT_SECONDS,
+        )
+
+        return APIResponse(
+            status="success",
+            data={"project_map": result},
+            hardware_backend_used=backend,
+        )
+    except asyncio.TimeoutError:
+        return _error_response("Operation timed out (30s)", backend)
+    except Exception as exc:
+        return _error_response(str(exc), backend)
+
+
+# ── POST /generate_project ───────────────────────────────────────
+
+@app.post("/generate_project", response_model=APIResponse)
+async def generate_project_endpoint(
+    body: GenerateProjectRequest,
+    authorization: Optional[str] = Header(default=None),
+):
+    """Generate ROCm definitions across a multi-file workspace."""
+    _check_auth(authorization)
+    backend = _detect()
+
+    try:
+        def _generate_project():
+            generated_map = {}
+            for file_record in body.files:
+                # Assuming frontend sends pre-classified metadata in the 'content' for this mock endpoint
+                # Real implementation would tie parse outputs to generate inputs uniquely
+                try:
+                    import json
+                    meta = json.loads(file_record.content)
+                    primitive = meta.get("primitive", "elementwise")
+                    gen = _do_generate(primitive, meta)
+                    generated_map[file_record.filename] = gen
+                except:
+                    # Fallback if content isn't metadata
+                    pass
+            return generated_map
+            
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, _generate_project),
+            timeout=TIMEOUT_SECONDS,
+        )
+
+        return APIResponse(
+            status="success",
+            data={"generated_map": result},
             hardware_backend_used=backend,
         )
     except asyncio.TimeoutError:

@@ -172,3 +172,44 @@ async def test_health():
     body = resp.json()
     assert body["status"] == "ok"
     assert body["hardware"]["backend"] in ("cpu_mock", "rocm_local", "mi300x_remote")
+
+
+# ── /parse_project ───────────────────────────────────────────────
+
+async def test_parse_project_endpoint():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/parse_project", json={
+            "files": [
+                {"filename": "kernel1.cu", "content": "__global__ void matmul(float* A){ for(int i=0;i<10;i++){ for(int j=0;j<10;j++){ A[i]=1; } } }"},
+                {"filename": "kernel2.cu", "content": "__global__ void reduce(float* A){ float val = __shfl_down_sync(0xffffffff, A[0], 16); }"}
+            ]
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    project_map = body["data"]["project_map"]
+    assert "kernel1.cu" in project_map
+    assert "kernel2.cu" in project_map
+    assert project_map["kernel1.cu"]["classification"]["primitive"] == "gemm"
+    assert project_map["kernel2.cu"]["classification"]["primitive"] == "reduction"
+
+
+# ── /generate_project ────────────────────────────────────────────
+
+async def test_generate_project_endpoint():
+    async with AsyncClient(transport=TRANSPORT, base_url="http://test") as ac:
+        resp = await ac.post("/generate_project", json={
+            "files": [
+                # Mocking metadata inside content
+                {"filename": "kernel1.cu", "content": '{"primitive": "gemm", "pattern": "tiled_shared", "dims": {"M": 128}}'},
+                {"filename": "kernel2.cu", "content": '{"primitive": "reduction", "pattern": "wavefront_reduce", "dims": {"N": 1024}}'}
+            ]
+        }, headers=HEADERS)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    gen_map = body["data"]["generated_map"]
+    assert "kernel1.cu" in gen_map
+    assert "kernel2.cu" in gen_map
+    assert "tiled_gemm_hip_template.cpp" in gen_map["kernel1.cu"]["generation"]["template_used"]
+    assert "wavefront_reduction_hip_template.cpp" in gen_map["kernel2.cu"]["generation"]["template_used"]

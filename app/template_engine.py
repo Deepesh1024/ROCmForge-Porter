@@ -51,6 +51,51 @@ TEMPLATE_MAP: Dict[Tuple[str, str], Dict[str, Any]] = {
             "Optimized multi-block reduce logic for hardware execution",
             "Mitigated LDS bank conflicts in hierarchical sum"
         ]
+    },
+    ("softmax", "fused_softmax_reduce"): {
+        "hip_template": "softmax_hip_template.cpp",
+        "triton_template": "softmax_triton_template.py",
+        "changes": [
+            "Fused exponentiation and normalization stages",
+            "Implemented cross-lane Wave64 intrinsic reductions",
+            "Replaced global memory syncs with warp primitives"
+        ]
+    },
+    ("layernorm", "fused_layernorm"): {
+        "hip_template": "layernorm_hip_template.cpp",
+        "triton_template": "layernorm_triton_template.py",
+        "changes": [
+            "Fused mean and variance accumulation in single-pass",
+            "Substituted software math with native rsqrtf",
+            "Applied vector-width memory alignments"
+        ]
+    },
+    ("conv", "direct_conv"): {
+        "hip_template": "conv_hip_template.cpp",
+        "triton_template": "conv_triton_template.py",
+        "changes": [
+            "Mapped explicit filter operations into MFMA core loops",
+            "Optimized halo regions for padding constraints",
+            "Scheduled register allocation for maximum wave occupancy"
+        ]
+    },
+    ("attention", "flash_attention"): {
+        "hip_template": "attention_hip_template.cpp",
+        "triton_template": "attention_triton_template.py",
+        "changes": [
+            "Deployed FlashAttention structural optimizations",
+            "Blocked SRAM logic for Q, K, V independent tiles",
+            "Aligned scale factor mathematics to fp16 fast-math routines"
+        ]
+    },
+    ("dropout", "fused_dropout"): {
+        "hip_template": "dropout_hip_template.cpp",
+        "triton_template": "dropout_triton_template.py",
+        "changes": [
+            "Applied deterministic hardware-level RNG seeding logic",
+            "Scaled scaling-factors aggressively within register space",
+            "Eliminated branching divergence in evaluation stages"
+        ]
     }
 }
 
@@ -98,14 +143,38 @@ def _extract_metadata(template_text: str) -> Dict[str, str]:
     return metadata
 
 
-def _fill_placeholders(template: str, meta: Dict[str, Any], dtype_map: Dict[str, str]) -> str:
+def _fill_placeholders(template: str, meta: Dict[str, Any], dtype_map: Dict[str, str], primitive: str, pattern: str) -> str:
     """Replace all {{ PLACEHOLDER }} tokens."""
     dtype = meta.get("dtype", "float")
     dims = meta.get("dims", {})
 
     dim_val = dims.get("M", dims.get("N", 1024))
-    tile_size = meta.get("tile_size", 16)
-    block_size = meta.get("block_size", 256)
+    
+    # Auto-Variant Selection Logic based on dimensions
+    tile_size = 16
+    block_size = 256
+    variant_note = "Using generic baseline."
+    
+    if primitive == "gemm":
+        m, n, k = dims.get("M", 1024), dims.get("N", 1024), dims.get("K", 1024)
+        if m >= 4096 and n >= 4096:
+            block_size = 256
+            tile_size = 32 # switch to large tile configuration
+            variant_note = "Switched to 32x32 TILE_SIZE due to massive M/N boundaries."
+        elif k < 256:
+            block_size = 64
+            tile_size = 8  # skinny matrix configuration
+            variant_note = "Skinny matrix detected, swapped to 64/8 register allocation limits."
+    elif primitive == "reduction" or primitive == "softmax":
+        n = dims.get("N", 1024)
+        if n <= 64:
+            block_size = 64
+            variant_note = "Small target dimensions mapped natively to single wave64."
+        else:
+            block_size = 256
+            variant_note = "Hierarchical sum deployed across 256 thread block limits."
+
+    meta["tuner_variants_applied"] = variant_note
 
     replacements = {
         "{{ DTYPE }}":      dtype_map.get(dtype, dtype),
@@ -138,6 +207,11 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         if primitive == "gemm": pattern = "tiled_shared"
         elif primitive == "fused_matmul": pattern = "fused_relu"
         elif primitive == "reduction": pattern = "wavefront_reduce"
+        elif primitive == "softmax": pattern = "fused_softmax_reduce"
+        elif primitive == "layernorm": pattern = "fused_layernorm"
+        elif primitive == "conv": pattern = "direct_conv"
+        elif primitive == "attention": pattern = "flash_attention"
+        elif primitive == "dropout": pattern = "fused_dropout"
         else: pattern = "vectorized"
         
     mapping = TEMPLATE_MAP.get((primitive, pattern))
@@ -151,7 +225,12 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         hip_template = f.read()
 
     metadata = _extract_metadata(hip_template)
-    rocm_code = _fill_placeholders(hip_template, meta, _DTYPE_MAP)
+    rocm_code = _fill_placeholders(hip_template, meta, _DTYPE_MAP, primitive, pattern)
+    
+    # Inject auto tuning note into changes applied
+    changes_arr = mapping["changes"].copy()
+    if "tuner_variants_applied" in meta:
+        changes_arr.append(f"Auto-Tuner: {meta['tuner_variants_applied']}")
 
     # Triton template (optional)
     triton_code = None
@@ -161,12 +240,12 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         if os.path.isfile(triton_path):
             with open(triton_path) as f:
                 triton_template = f.read()
-            triton_code = _fill_placeholders(triton_template, meta, _TRITON_DTYPE_MAP)
+            triton_code = _fill_placeholders(triton_template, meta, _TRITON_DTYPE_MAP, primitive, pattern)
 
     return {
         "rocm_code":       rocm_code,
         "triton_code":     triton_code,
         "template_used":   hip_filename,
         "metadata":        metadata,
-        "changes_applied": mapping["changes"],
+        "changes_applied": changes_arr,
     }
