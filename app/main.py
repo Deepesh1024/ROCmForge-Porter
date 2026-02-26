@@ -146,6 +146,9 @@ async def generate_endpoint(
 
         safety = result["safety"]
         template_used = result["generation"].get("template_used")
+        changes_applied = result["generation"].get("changes_applied", [])
+        pattern_detected = body.meta.get("pattern", "vectorized")
+
         rai = responsible_ai.build_responsible_ai_bundle(
             "generate", body.primitive, backend, safety, template_used,
         )
@@ -153,7 +156,12 @@ async def generate_endpoint(
         audit_id = audit_logger.log(
             "generate",
             {"primitive": body.primitive, "meta": body.meta},
-            {"template_used": template_used, "safety_score": safety.get("score")},
+            {
+                "template_used": template_used,
+                "pattern_detected": pattern_detected,
+                "changes_applied": changes_applied,
+                "safety_score": safety.get("score")
+            },
             hardware_backend_used=backend,
             safety_score=rai["safety_score"],
             risk_flags=rai["risk_flags"],
@@ -394,7 +402,11 @@ async def register_mi300x_endpoint(
 def _do_parse(cuda_code: str) -> dict:
     hipified   = hipify_runner.run_hipify(cuda_code)
     classified = primitive_classifier.classify(cuda_code)
-    safety     = safety_engine.analyse(hipified["hipified_code"])
+    safety     = safety_engine.analyse(
+        hipified["hipified_code"],
+        pattern=classified.get("pattern"),
+        meta=classified.get("meta")
+    )
     return {
         "hipify":         hipified,
         "classification": classified,
@@ -404,7 +416,11 @@ def _do_parse(cuda_code: str) -> dict:
 
 def _do_generate(primitive: str, meta: dict) -> dict:
     generated = template_engine.generate(primitive, meta)
-    safety    = safety_engine.analyse(generated["rocm_code"])
+    safety    = safety_engine.analyse(
+        generated["rocm_code"],
+        pattern=meta.get("pattern"),
+        meta=meta
+    )
     return {
         "generation": generated,
         "safety":     safety,

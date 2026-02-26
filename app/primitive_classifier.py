@@ -93,13 +93,15 @@ def _score_patterns(code: str, patterns: List[str]) -> int:
 
 def classify(code: str) -> Dict[str, Any]:
     """
-    Classify *code* as gemm / reduction / elementwise.
+    Classify *code* as gemm / reduction / elementwise / fused_matmul.
 
     Returns
     -------
     dict
-        primitive : str   — "gemm", "reduction", or "elementwise"
+        primitive : str   — "gemm", "reduction", "elementwise", or "fused_matmul"
         dtype     : str   — detected data type
+        shape     : str   — shape format (e.g. "M=1024, N=1024, K=1024")
+        pattern   : str   — detected semantic pattern
         meta      : dict  — additional metadata (dims, scores)
     """
     gemm_score = _score_patterns(code, _GEMM_PATTERNS)
@@ -116,20 +118,50 @@ def classify(code: str) -> Dict[str, Any]:
     dtype = _detect_dtype(code)
     dims  = _extract_dims(code)
 
+    # Detect fused_matmul if gemm has a relu
+    if primitive == "gemm" and re.search(r'\brelu\b', code, re.IGNORECASE):
+        primitive = "fused_matmul"
+
     # Fallback dims when none detected
     if not dims:
-        if primitive == "gemm":
+        if primitive in ("gemm", "fused_matmul"):
             dims = {"M": 1024, "N": 1024, "K": 1024}
         elif primitive == "reduction":
             dims = {"N": 1024}
         else:
             dims = {"N": 1024}
 
+    shape = ", ".join(f"{k}={v}" for k, v in dims.items())
+
+    # Detect pattern based on primitive
+    pattern = ""
+    if primitive == "fused_matmul":
+        pattern = "fused_relu"
+    elif primitive == "gemm":
+        if re.search(r'\bshared\b|__shared__', code):
+            pattern = "tiled_shared"
+        else:
+            pattern = "tiled_shared"
+    elif primitive == "elementwise":
+        if re.search(r'float4|float2|double2|int4', code):
+            pattern = "vectorized"
+        else:
+            pattern = "vectorized"
+    elif primitive == "reduction":
+        if re.search(r'__shfl_down_sync|warpReduce', code):
+            pattern = "wavefront_reduce"
+        else:
+            pattern = "wavefront_reduce"
+
     return {
         "primitive": primitive,
         "dtype": dtype,
+        "shape": shape,
+        "pattern": pattern,
         "meta": {
             "dims": dims,
             "pattern_scores": scores,
+            "pattern": pattern
         },
     }
+

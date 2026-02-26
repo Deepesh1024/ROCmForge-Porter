@@ -45,7 +45,7 @@ async def test_generate_endpoint():
     assert body["status"] == "success"
     gen = body["data"]["generation"]
     assert "rocm_code" in gen
-    assert gen["template_used"] == "gemm_hip_template.cpp"
+    assert gen["template_used"] == "tiled_gemm_hip_template.cpp"
     assert body["safety_score"] is not None
 
 

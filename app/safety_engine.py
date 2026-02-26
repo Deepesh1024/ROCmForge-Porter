@@ -119,7 +119,28 @@ def _check_general_safety(code: str) -> tuple:
 # Public API
 # ──────────────────────────────────────────────────────────────────
 
-def analyse(code: str) -> Dict[str, Any]:
+def _check_pattern_bonus(code: str, pattern: str) -> tuple:
+    """Provide a score bonus and risk flag optimizations based on recognized patterns."""
+    issues: List[str] = []
+    penalty = 0
+
+    if pattern == "wavefront_reduce":
+        issues.append("Pattern Bonus: Wavefront reduction intrinsic usage reduces shared memory risks")
+        penalty -= 15
+    elif pattern == "fused_relu":
+        issues.append("Pattern Bonus: Fused activation minimizes global memory roundtrips")
+        penalty -= 10
+    elif pattern == "tiled_shared":
+        issues.append("Pattern Bonus: Tiled shared memory optimizes global bounds")
+        penalty -= 5
+    elif pattern == "vectorized":
+        issues.append("Pattern Bonus: Vectorized elementwise maximizes memory bus utility")
+        penalty -= 5
+
+    flag = "PATTERN_OPTIMIZED" if penalty < 0 else None
+    return penalty, issues, flag
+
+def analyse(code: str, pattern: str = None, meta: dict = None) -> Dict[str, Any]:
     """
     Run all safety checks on *code* and return a structured report.
 
@@ -149,7 +170,14 @@ def analyse(code: str) -> Dict[str, Any]:
         if flag:
             risk_flags.append(flag)
 
-    score = max(0, 100 - total_penalty)
+    if pattern:
+        p_penalty, p_details, p_flag = _check_pattern_bonus(code, pattern)
+        total_penalty += p_penalty
+        all_details.extend(p_details)
+        if p_flag:
+            risk_flags.append(p_flag)
+
+    score = max(0, min(100, 100 - total_penalty))
 
     return {
         "score": score,

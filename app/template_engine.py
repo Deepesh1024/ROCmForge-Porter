@@ -15,16 +15,43 @@ from app.config import TEMPLATE_DIR
 
 # ── Template filename map ────────────────────────────────────────
 
-_TEMPLATE_MAP: Dict[str, str] = {
-    "gemm":        "gemm_hip_template.cpp",
-    "reduction":   "reduction_hip_template.cpp",
-    "elementwise": "elemwise_hip_template.cpp",
-}
-
-_TRITON_TEMPLATE_MAP: Dict[str, str] = {
-    "gemm":        "gemm_triton_template.py",
-    "reduction":   "reduction_triton_template.py",
-    "elementwise": "elemwise_triton_template.py",
+TEMPLATE_MAP: Dict[Tuple[str, str], Dict[str, Any]] = {
+    ("gemm", "tiled_shared"): {
+        "hip_template": "tiled_gemm_hip_template.cpp",
+        "triton_template": "tiled_gemm_triton_template.py",
+        "changes": [
+            "Applied shared memory tiling for improved cache locality",
+            "Configured block sizes for wave64 occupancy",
+            "Swapped cuBLAS calls for rocBLAS equivalents"
+        ]
+    },
+    ("fused_matmul", "fused_relu"): {
+        "hip_template": "fused_matmul_relu_hip_template.cpp",
+        "triton_template": "fused_matmul_relu_triton_template.py",
+        "changes": [
+            "Fused ReLU activation into GEMM epilogue",
+            "Eliminated intermediate global memory allocation",
+            "Optimized memory alignment for vector operations"
+        ]
+    },
+    ("elementwise", "vectorized"): {
+        "hip_template": "vectorized_elementwise_hip_template.cpp",
+        "triton_template": "vectorized_elementwise_triton_template.py",
+        "changes": [
+            "Vectorized global memory load/store operations (float4/double2)",
+            "Ensured continuous memory access patterns",
+            "Added robust boundary checks for unaligned tails"
+        ]
+    },
+    ("reduction", "wavefront_reduce"): {
+        "hip_template": "wavefront_reduction_hip_template.cpp",
+        "triton_template": "wavefront_reduction_triton_template.py",
+        "changes": [
+            "Replaced shared array syncs with native wave64 shuffle instructions",
+            "Optimized multi-block reduce logic for hardware execution",
+            "Mitigated LDS bank conflicts in hierarchical sum"
+        ]
+    }
 }
 
 # ── Placeholder defaults ─────────────────────────────────────────
@@ -99,13 +126,25 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     Generate ROCm code from templates.
 
     Returns dict with:
-        rocm_code      — filled HIP C++ template
-        triton_code    — filled Triton Python template (if available)
-        template_used  — filename of the HIP template
-        metadata       — extracted template metadata dict
+        rocm_code       — filled HIP C++ template
+        triton_code     — filled Triton Python template (if available)
+        template_used   — filename of the HIP template
+        metadata        — extracted template metadata dict
+        changes_applied — specific changes made based on pattern
     """
-    # HIP template
-    hip_filename = _TEMPLATE_MAP.get(primitive, _TEMPLATE_MAP["elementwise"])
+    pattern = meta.get("pattern")
+    # Provide default patterns if None 
+    if not pattern:
+        if primitive == "gemm": pattern = "tiled_shared"
+        elif primitive == "fused_matmul": pattern = "fused_relu"
+        elif primitive == "reduction": pattern = "wavefront_reduce"
+        else: pattern = "vectorized"
+        
+    mapping = TEMPLATE_MAP.get((primitive, pattern))
+    if not mapping:
+        mapping = TEMPLATE_MAP[("elementwise", "vectorized")]
+        
+    hip_filename = mapping["hip_template"]
     hip_path = os.path.join(TEMPLATE_DIR, hip_filename)
 
     with open(hip_path) as f:
@@ -116,7 +155,7 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
 
     # Triton template (optional)
     triton_code = None
-    triton_filename = _TRITON_TEMPLATE_MAP.get(primitive)
+    triton_filename = mapping.get("triton_template")
     if triton_filename:
         triton_path = os.path.join(TEMPLATE_DIR, triton_filename)
         if os.path.isfile(triton_path):
@@ -125,8 +164,9 @@ def generate(primitive: str, meta: Dict[str, Any]) -> Dict[str, Any]:
             triton_code = _fill_placeholders(triton_template, meta, _TRITON_DTYPE_MAP)
 
     return {
-        "rocm_code":     rocm_code,
-        "triton_code":   triton_code,
-        "template_used": hip_filename,
-        "metadata":      metadata,
+        "rocm_code":       rocm_code,
+        "triton_code":     triton_code,
+        "template_used":   hip_filename,
+        "metadata":        metadata,
+        "changes_applied": mapping["changes"],
     }
