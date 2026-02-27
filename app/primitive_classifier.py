@@ -76,12 +76,35 @@ def _extract_dims_from_code(code: str) -> Dict[str, int]:
     return dims
 
 
+def _is_cuda_code(code: str) -> bool:
+    """Check if input looks like actual CUDA/C++ code (not random text)."""
+    indicators = [
+        r'__global__', r'__device__', r'__host__',
+        r'__shared__', r'__constant__',
+        r'\bblockIdx\b', r'\bthreadIdx\b', r'\bblockDim\b', r'\bgridDim\b',
+        r'\bcudaMalloc\b', r'\bcudaMemcpy\b', r'\bcudaFree\b',
+        r'\bhipMalloc\b', r'\bhipMemcpy\b',
+        r'\bvoid\b\s+\w+\s*\(', r'\bfloat\b', r'\bdouble\b', r'\bint\b',
+        r'#include', r'\bfor\s*\(', r'\bwhile\s*\(',
+        r'\*\s*\w+', r'\w+\s*\[',  # pointer or array access
+        r'<<<',  # kernel launch syntax
+    ]
+    matches = sum(1 for pat in indicators if re.search(pat, code))
+    # Need at least 2 indicators to be considered code
+    return matches >= 2
+
+
 def _keyword_fallback_classify(code: str) -> Dict[str, Any]:
     """
     Deterministic keyword-based fallback classifier.
     Used when the LLM is unavailable (bad API key, network error, etc.).
     Mirrors the old AST classifier logic using simple keyword matching.
     """
+    # Pre-check: if input doesn't look like code at all, return unknown
+    if not _is_cuda_code(code):
+        return {"primitive": "unknown", "pattern": "unknown",
+                "memory_bound": False, "shared_memory_used": False}
+
     code_lower = code.lower()
 
     has_shared = "__shared__" in code
