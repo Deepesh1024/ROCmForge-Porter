@@ -76,6 +76,81 @@ def _extract_dims_from_code(code: str) -> Dict[str, int]:
     return dims
 
 
+def _keyword_fallback_classify(code: str) -> Dict[str, Any]:
+    """
+    Deterministic keyword-based fallback classifier.
+    Used when the LLM is unavailable (bad API key, network error, etc.).
+    Mirrors the old AST classifier logic using simple keyword matching.
+    """
+    code_lower = code.lower()
+
+    has_shared = "__shared__" in code
+    has_shfl = any(k in code for k in ["__shfl", "warp_reduce"])
+    has_atomic = any(k in code for k in ["atomicAdd", "atomicMax"])
+    has_cublas = any(k in code_lower for k in ["cublas", "rocblas"])
+    has_matmul_name = bool(re.search(r'\b(matmul|gemm|sgemm|dgemm)\b', code_lower))
+    has_2d_grid = "blockIdx.y" in code or "threadIdx.y" in code
+    has_conv = any(k in code_lower for k in ["conv", "cudnn", "kernel_h", "kernel_w"])
+    has_exp = any(k in code_lower for k in ["expf", "exp(", "exp "])
+    has_rsqrt = any(k in code_lower for k in ["rsqrtf", "rsqrt", "sqrt"])
+    has_relu = bool(re.search(r'\brelu\b|>\s*0\s*\?', code_lower))
+    has_dropout = any(k in code_lower for k in ["drop", "rand", "seed"])
+    has_attention = sum(1 for k in ["float* Q", "float* K", "float* V", "* Q,", "* K,", "* V,"] if k in code) >= 2
+
+    # Count for loops
+    for_count = len(re.findall(r'\bfor\s*\(', code))
+
+    # Classification priority (most specific first)
+    if has_cublas or has_matmul_name:
+        return {"primitive": "gemm", "pattern": "tiled_shared",
+                "memory_bound": False, "shared_memory_used": has_shared}
+
+    if has_attention and has_exp:
+        return {"primitive": "attention", "pattern": "flash_attention",
+                "memory_bound": True, "shared_memory_used": has_shared}
+
+    if has_exp and has_shfl and for_count >= 2:
+        return {"primitive": "softmax", "pattern": "fused_softmax_reduce",
+                "memory_bound": True, "shared_memory_used": has_shared}
+
+    if has_rsqrt and for_count >= 2 and has_shfl:
+        return {"primitive": "layernorm", "pattern": "fused_layernorm",
+                "memory_bound": True, "shared_memory_used": has_shared}
+
+    if has_conv or for_count >= 4:
+        return {"primitive": "conv", "pattern": "direct_conv",
+                "memory_bound": False, "shared_memory_used": has_shared}
+
+    if has_dropout and ("rand" in code_lower or "seed" in code_lower):
+        return {"primitive": "dropout", "pattern": "fused_dropout",
+                "memory_bound": False, "shared_memory_used": has_shared}
+
+    if has_shfl or has_atomic:
+        pattern = "wavefront_reduce" if has_shfl else "atomic_reduce"
+        return {"primitive": "reduction", "pattern": pattern,
+                "memory_bound": True, "shared_memory_used": has_shared}
+
+    # 2D grid + for loop = strong GEMM signal (row/col matrix access)
+    if has_2d_grid and for_count >= 1:
+        if has_relu:
+            return {"primitive": "fused_matmul", "pattern": "fused_relu",
+                    "memory_bound": False, "shared_memory_used": has_shared}
+        return {"primitive": "gemm", "pattern": "tiled_shared" if has_shared else "tiled_shared",
+                "memory_bound": False, "shared_memory_used": has_shared}
+
+    if for_count >= 1 and (has_shared or for_count >= 2):
+        if has_relu:
+            return {"primitive": "fused_matmul", "pattern": "fused_relu",
+                    "memory_bound": False, "shared_memory_used": has_shared}
+        return {"primitive": "gemm", "pattern": "tiled_shared" if has_shared else "tiled_shared",
+                "memory_bound": False, "shared_memory_used": has_shared}
+
+    # Default: elementwise
+    has_vec = bool(re.search(r'float4|float2|double2|int4', code))
+    return {"primitive": "elementwise", "pattern": "vectorized" if has_vec else "scalar",
+            "memory_bound": True, "shared_memory_used": has_shared}
+
+
 def _call_llm(cuda_code: str) -> Dict[str, Any]:
     """
     Call LLM to extract semantic primitives from CUDA code.
@@ -105,7 +180,8 @@ def _call_llm(cuda_code: str) -> Dict[str, Any]:
 
 def classify(code: str) -> Dict[str, Any]:
     """
-    Classify CUDA code by calling LLM for semantic extraction.
+    Classify CUDA code via LLM semantic extraction.
+    Falls back to deterministic keyword classifier if LLM unavailable.
 
     Returns
     -------
@@ -114,38 +190,35 @@ def classify(code: str) -> Dict[str, Any]:
         dtype              : str   — "float" (default)
         shape              : str   — shape string
         pattern            : str   — detected semantic pattern
-        meta               : dict  — dims + pattern + LLM extraction result
-        semantic_extraction: dict  — raw LLM JSON output
+        meta               : dict  — dims + pattern
+        semantic_extraction: dict  — raw LLM/fallback JSON output
     """
-    # Default fallback result
-    fallback_primitive = "unknown"
     semantic_result: Dict[str, Any] = {}
+    llm_used = False
 
+    # Try LLM first
     try:
         semantic_result = _call_llm(code)
-        primitive = semantic_result.get("primitive", fallback_primitive)
-        # Validate primitive value
+        primitive = semantic_result.get("primitive", "unknown")
         valid_primitives = {
             "gemm", "reduction", "elementwise", "fused_matmul",
             "softmax", "layernorm", "conv", "attention", "dropout", "unknown",
         }
         if primitive not in valid_primitives:
-            primitive = fallback_primitive
+            primitive = "unknown"
+        llm_used = True
     except Exception:
-        primitive = fallback_primitive
-        semantic_result = {
-            "primitive": "unknown",
-            "pattern": "unknown",
-            "memory_bound": False,
-            "shared_memory_used": False,
-        }
+        # LLM unavailable — use deterministic keyword fallback
+        semantic_result = _keyword_fallback_classify(code)
+        semantic_result["_classifier"] = "keyword_fallback"
+        primitive = semantic_result["primitive"]
 
     # Use LLM-returned pattern or fall back to default
     pattern = semantic_result.get("pattern")
     if not pattern or pattern == "string":
         pattern = _DEFAULT_PATTERN.get(primitive, "vectorized")
 
-    # Extract dimensions from code (best-effort regex fallback)
+    # Extract dimensions from code (best-effort regex)
     dims = _extract_dims_from_code(code)
     if not dims:
         dims = _DEFAULT_DIMS.get(primitive, {"N": 1024}).copy()
