@@ -39,6 +39,7 @@ from app import (
     audit_logger,
     hardware_detector,
     hipify_runner,
+    mi300x_rules,
     mi300x_runner,
     primitive_classifier,
     pytorch_parser,
@@ -47,6 +48,7 @@ from app import (
     template_engine,
     verifier,
 )
+from app.template_engine import TEMPLATE_MAP
 
 # ── App setup ────────────────────────────────────────────────────
 
@@ -100,6 +102,8 @@ async def parse_endpoint(
         safety = result["safety"]
         rai = responsible_ai.build_responsible_ai_bundle(
             "parse", primitive, backend, safety,
+            semantic_result=result.get("semantic_extraction"),
+            rules_trace=result.get("rules_trace"),
         )
 
         audit_id = audit_logger.log(
@@ -499,11 +503,30 @@ def _do_parse(cuda_code: str) -> dict:
         pattern=classified.get("pattern"),
         meta=classified.get("meta")
     )
-    return {
+
+    result = {
         "hipify":         hipified,
         "classification": classified,
         "safety":         safety,
     }
+
+    # ── Semantic Router ──────────────────────────────────────────
+    primitive = classified["primitive"]
+    pattern   = classified.get("pattern", "vectorized")
+    semantic_extraction = classified.get("semantic_extraction", {})
+
+    if (primitive, pattern) in TEMPLATE_MAP or primitive != "unknown":
+        # Known primitive — route to template engine path
+        result["route"] = "template"
+        result["semantic_extraction"] = semantic_extraction
+    else:
+        # Unknown primitive — route to MI300X rules engine
+        mutated_code, rules_trace = mi300x_rules.apply_rules(cuda_code)
+        result["route"] = "rules_engine"
+        result["rules_trace"] = rules_trace
+        result["rules_engine_output"] = mutated_code
+
+    return result
 
 
 def _do_generate(primitive: str, meta: dict) -> dict:

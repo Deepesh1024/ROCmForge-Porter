@@ -1,6 +1,27 @@
-# ROCmForge Studio — Backend API v2.1
+# ROCmForge Studio — Backend API v3.0 (QuickPort)
 
-Responsible-AI CUDA-to-ROCm porting engine. Deploy and call from any frontend.
+Responsible-AI CUDA-to-ROCm porting engine with **Semantic Router + MI300X Expert System**.
+
+## Architecture Overview
+
+```
+CUDA Code
+   │
+   ├─▶ Hipify Runner (CUDA→HIP API translation)
+   │
+   ├─▶ Semantic Extractor (LLM via Groq)
+   │       └─▶ Returns: { primitive, pattern, memory_bound, shared_memory_used }
+   │
+   └─▶ Semantic Router
+           ├─ primitive in TEMPLATE_MAP? ──▶ Template Engine (deterministic code gen)
+           └─ unknown / not mapped?     ──▶ MI300X Rules Engine (4 arch-specific rules)
+```
+
+**Key Design:**
+- **LLM classifies** mathematical intent (never generates code)
+- **Template Engine** produces all kernel code deterministically
+- **MI300X Rules Engine** handles fallback with Wave64, shuffle, grid, and LDS rules
+- **Reasoning traces** are dynamically populated from actual routing decisions
 
 ## Quick Start
 
@@ -32,7 +53,7 @@ No auth required.
 {
   "status": "ok",
   "service": "ROCmForge Studio",
-  "version": "2.1.0-nationals-final",
+  "version": "3.0.0-quickport",
   "hardware": {
     "backend": "cpu_mock",
     "hipcc_available": false,
@@ -46,51 +67,51 @@ No auth required.
 
 ### `POST /parse`
 
-Hipify CUDA code → classify primitive → safety analysis.
+Hipify CUDA code → LLM semantic classification → safety analysis → **semantic routing**.
 
 **Request:**
 ```json
 {
-  "cuda_code": "__global__ void k(float* A, float* B) { A[0] = B[0]; }"
+  "cuda_code": "__global__ void k(float* A) { int tid = threadIdx.x; __shared__ float smem[32]; smem[tid] = A[tid]; float val = __shfl_down_sync(0xffffffff, smem[tid], warpSize/2); }"
 }
 ```
 
-**Response:**
+**Response (routed to Rules Engine):**
 ```json
 {
   "status": "success",
-  "audit_id": "a1b2c3d4e5f6",
-  "safety_score": 75,
-  "execution_confidence": null,
-  "hardware_backend_used": "cpu_mock",
-  "risk_flags": ["VECTORISATION_ISSUE"],
-  "attribution": [
-    "Safety rules v2.0 — ROCmForge Studio Nationals Build",
-    "Wave64 guidance: AMD CDNA3 ISA Reference Manual"
-  ],
+  "audit_id": "2a4c1628179f",
+  "safety_score": 80,
+  "hardware_backend_used": "mi300x_remote",
+  "risk_flags": ["VECTORISATION_ISSUE", "GENERAL_SAFETY"],
+  "attribution": ["Safety rules v2.0 — ROCmForge Studio Nationals Build", "..."],
   "reasoning_trace": [
-    "[1] Received parse request for primitive: elementwise",
-    "[2] Hardware backend detected: cpu_mock",
-    "[3] Applied mock hipify-clang (CUDA → HIP API translation)",
-    "[4] Classified CUDA primitive via deterministic regex engine",
-    "[5] Ran Responsible-AI safety analysis on hipified code"
+    "[1] Received parse request for primitive: unknown",
+    "[2] Hardware backend detected: mi300x_remote",
+    "[3] Primitive unknown or not in TEMPLATE_MAP — routed to MI300X rules engine",
+    "[4] [ARCHITECTURE] MI300X uses Wave64. Hardcoding wavefront boundary from 32 to 64.",
+    "[5] [COMPATIBILITY] Sync variants of shuffle are NVIDIA-specific. Reverting to base shuffle for ROCm compatibility.",
+    "[6] [SYNTAX] Mapping standard grid coordinates to HIP.",
+    "[7] [MEMORY] Local Data Share (LDS) allocated. Note: MI300X LDS occupancy limit is 64KB per CU."
   ],
   "data": {
-    "hipify": {
-      "hipified_code": "// [hipified] ...",
-      "changes": ["cudaMalloc → hipMalloc"],
-      "method": "mock hipify (regex)"
-    },
+    "hipify": { "hipified_code": "...", "changes": [], "method": "mock hipify (regex)" },
     "classification": {
-      "primitive": "elementwise",
+      "primitive": "unknown",
       "dtype": "float",
-      "dims": {"N": 1024}
+      "shape": "N=1024",
+      "pattern": "unknown",
+      "semantic_extraction": { "primitive": "unknown", "pattern": "unknown", "memory_bound": false, "shared_memory_used": false }
     },
-    "safety": {
-      "score": 75,
-      "details": ["..."],
-      "risk_flags": ["VECTORISATION_ISSUE"]
-    }
+    "safety": { "score": 80, "details": ["..."], "risk_flags": ["VECTORISATION_ISSUE"] },
+    "route": "rules_engine",
+    "rules_trace": [
+      "[ARCHITECTURE] MI300X uses Wave64. Hardcoding wavefront boundary from 32 to 64.",
+      "[COMPATIBILITY] Sync variants of shuffle are NVIDIA-specific. Reverting to base shuffle for ROCm compatibility.",
+      "[SYNTAX] Mapping standard grid coordinates to HIP.",
+      "[MEMORY] Local Data Share (LDS) allocated. Note: MI300X LDS occupancy limit is 64KB per CU."
+    ],
+    "rules_engine_output": "__global__ void custom(float* A) { int tid = hipThreadIdx.x; __shared__ float smem[64]; ... }"
   }
 }
 ```
@@ -117,8 +138,14 @@ Generate ROCm HIP + Triton code from templates (NO LLM code gen).
 | `primitive` values | Description |
 |---|---|
 | `"gemm"` | Matrix multiplication |
+| `"fused_matmul"` | GEMM + activation fusion |
 | `"reduction"` | Sum/max reduction |
 | `"elementwise"` | Pointwise ops (add, mul, relu) |
+| `"softmax"` | Fused softmax |
+| `"layernorm"` | Layer normalization |
+| `"conv"` | Convolution |
+| `"attention"` | Flash attention |
+| `"dropout"` | Fused dropout |
 
 **Response:**
 ```json
@@ -387,7 +414,7 @@ const data = await verifyRes.json();
 ## Testing
 
 ```bash
-python -m pytest app/tests.py -v    # 10 tests
+python -m pytest app/tests.py -v    # 12 tests
 ```
 
 ## Deployment
@@ -406,33 +433,47 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `BEARER_TOKEN` | `dev-token` | API auth token |
-| `GROQ_API_KEY` | (empty) | Optional Groq LLM key for explanations |
+| `GROQ_API_KEY` | (required) | Groq API key for LLM semantic extraction |
 | `GROQ_MODEL` | `openai/gpt-oss-120b` | Groq model name |
+| `GROQ_BASE_URL` | `https://api.groq.com/openai/v1` | Groq API base URL |
 
 ## Project Structure
 
 ```
 backend/
 ├── app/
-│   ├── main.py                 ← FastAPI (7 endpoints)
-│   ├── config.py               ← Constants + paths
+│   ├── main.py                 ← FastAPI (7 endpoints) + Semantic Router
+│   ├── config.py               ← Constants + paths + Groq config
 │   ├── models.py               ← Pydantic request/response models
 │   ├── hardware_detector.py    ← rocm_local / cpu_mock / mi300x_remote
 │   ├── hipify_runner.py        ← Subprocess hipify-clang + mock fallback
-│   ├── primitive_classifier.py ← Regex GEMM/reduction/elementwise
+│   ├── primitive_classifier.py ← LLM-based semantic CUDA classifier (Groq)
+│   ├── mi300x_rules.py         ← MI300X deterministic expert rules engine [NEW]
 │   ├── pytorch_parser.py       ← AT_DISPATCH + kernel extraction
-│   ├── template_engine.py      ← YAML metadata + placeholder fill
-│   ├── responsible_ai.py       ← Reasoning trace + attribution + confidence
+│   ├── template_engine.py      ← YAML metadata + placeholder fill (UNCHANGED)
+│   ├── responsible_ai.py       ← Dynamic reasoning trace + attribution
 │   ├── safety_engine.py        ← Wave64/vectorisation/LDS checks
 │   ├── verifier.py             ← Real CPU timing + MI300X cache
 │   ├── mi300x_runner.py        ← Droplet registration
+│   ├── llm_explainer.py        ← LLM explanations (Groq)
 │   ├── audit_logger.py         ← Extended JSON audit logs
 │   ├── utils.py                ← L2 norm, helpers
 │   └── sample_inputs/          ← Test .cu files
 ├── cache/
 │   └── mi300x_cache.json       ← Pre-recorded MI300X metrics (18 entries)
-├── templates/                  ← HIP C++ & Triton Python templates
+├── templates/                  ← HIP C++ & Triton Python templates (9 primitives)
 ├── audit_logs/                 ← Auto-generated per request
 ├── requirements.txt
 └── README.md
 ```
+
+## MI300X Rules Engine
+
+When the LLM classifier returns `"unknown"` or a primitive not in `TEMPLATE_MAP`, the code is routed through `mi300x_rules.apply_rules()` which applies these deterministic transformations:
+
+| Rule | Match | Replacement | Trace Category |
+|------|-------|-------------|----------------|
+| Wave64 | `warpSize` / `32` in warp context | `64` | `[ARCHITECTURE]` |
+| Shuffle | `__shfl_down_sync` | `__shfl_down` | `[COMPATIBILITY]` |
+| Grid coords | `blockIdx` / `threadIdx` | `hipBlockIdx` / `hipThreadIdx` | `[SYNTAX]` |
+| LDS detect | `__shared__` | No mutation (advisory) | `[MEMORY]` |

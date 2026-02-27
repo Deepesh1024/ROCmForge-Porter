@@ -74,9 +74,10 @@ def _run_cpu_reference(primitive: str, dtype: str, dims: Dict[str, int]):
     np.random.seed(42)
 
     if primitive == "gemm":
-        M = min(dims.get("M", 128), 512)
-        N = min(dims.get("N", 128), 512)
-        K = min(dims.get("K", 128), 512)
+        m_val, n_val, k_val = dims.get("M", 0), dims.get("N", 0), dims.get("K", 0)
+        M = max(128, min(m_val, 512)) if m_val > 0 else 128
+        N = max(128, min(n_val, 512)) if n_val > 0 else 128
+        K = max(128, min(k_val, 512)) if k_val > 0 else 128
         A = np.random.randn(M, K).astype(np_dtype)
         B = np.random.randn(K, N).astype(np_dtype)
 
@@ -85,7 +86,8 @@ def _run_cpu_reference(primitive: str, dtype: str, dims: Dict[str, int]):
         cpu_ms = (time.perf_counter() - t0) * 1000.0
 
     elif primitive == "reduction":
-        n = min(dims.get("N", 1024), 4096)
+        n_val = dims.get("N", 0)
+        n = max(1024, min(n_val, 4096)) if n_val > 0 else 1024
         A = np.random.randn(n).astype(np_dtype)
 
         t0 = time.perf_counter()
@@ -93,7 +95,8 @@ def _run_cpu_reference(primitive: str, dtype: str, dims: Dict[str, int]):
         cpu_ms = (time.perf_counter() - t0) * 1000.0
 
     else:  # elementwise
-        n = min(dims.get("N", 1024), 4096)
+        n_val = dims.get("N", 0)
+        n = max(1024, min(n_val, 4096)) if n_val > 0 else 1024
         A = np.random.randn(n).astype(np_dtype)
         B = np.random.randn(n).astype(np_dtype)
 

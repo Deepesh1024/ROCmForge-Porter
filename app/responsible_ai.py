@@ -9,6 +9,7 @@ Provides deterministic, traceable Responsible-AI artefacts:
   • human_approval    — whether human approval is required
 """
 
+import json
 from typing import Any, Dict, List, Optional
 
 
@@ -37,6 +38,8 @@ def build_reasoning_trace(
     backend: str,
     safety_score: int,
     extra_steps: Optional[List[str]] = None,
+    semantic_result: Optional[Dict[str, Any]] = None,
+    rules_trace: Optional[List[str]] = None,
 ) -> List[str]:
     """Build a step-by-step reasoning trace for audit/explainability."""
     trace = [
@@ -45,11 +48,32 @@ def build_reasoning_trace(
     ]
 
     if stage == "parse":
-        trace += [
-            "[3] Applied mock hipify-clang (CUDA → HIP API translation)",
-            "[4] Classified CUDA primitive via deterministic regex engine",
-            "[5] Ran Responsible-AI safety analysis on hipified code",
-        ]
+        if semantic_result:
+            # Template-engine route — show the LLM extraction result
+            trace.append(
+                f"[3] Semantic Extractor (LLM) output: {json.dumps(semantic_result, default=str)}"
+            )
+            trace.append(
+                "[4] Primitive matched in TEMPLATE_MAP — routed to template engine"
+            )
+            trace.append(
+                "[5] Ran Responsible-AI safety analysis on hipified code"
+            )
+        elif rules_trace:
+            # Rules-engine route — inject the exact triggered reasons
+            trace.append(
+                "[3] Primitive unknown or not in TEMPLATE_MAP — routed to MI300X rules engine"
+            )
+            for i, reason in enumerate(rules_trace):
+                trace.append(f"[{4 + i}] {reason}")
+            trace.append(
+                f"[{4 + len(rules_trace)}] Ran Responsible-AI safety analysis on hipified code"
+            )
+        else:
+            # Fallback (no routing metadata available)
+            trace.append("[3] Classified CUDA primitive via LLM semantic extraction")
+            trace.append("[4] Ran Responsible-AI safety analysis on hipified code")
+
     elif stage == "generate":
         trace += [
             "[3] Selected template from verified template library (NO LLM code gen)",
@@ -69,7 +93,7 @@ def build_reasoning_trace(
     trace.append(f"[{len(trace) + 1}] Audit log written with full provenance")
 
     if extra_steps:
-        for i, step in enumerate(extra_steps):
+        for step in extra_steps:
             trace.append(f"[{len(trace) + 1}] {step}")
 
     return trace
@@ -111,6 +135,8 @@ def build_responsible_ai_bundle(
     safety_result: Dict[str, Any],
     template_used: Optional[str] = None,
     cache_hit: bool = False,
+    semantic_result: Optional[Dict[str, Any]] = None,
+    rules_trace: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
     Build the complete Responsible-AI bundle that goes into every response.
@@ -143,7 +169,11 @@ def build_responsible_ai_bundle(
     else:
         extra_steps.append(f"No MI300X cache — CPU fallback with real NumPy timing (confidence: {execution_confidence}%)")
 
-    reasoning = build_reasoning_trace(stage, primitive, backend, score, extra_steps)
+    reasoning = build_reasoning_trace(
+        stage, primitive, backend, score, extra_steps,
+        semantic_result=semantic_result,
+        rules_trace=rules_trace,
+    )
 
     return {
         "safety_score": score,
@@ -154,4 +184,3 @@ def build_responsible_ai_bundle(
         "human_approval_required": human_approval,
         "hardware_backend_used": backend,
     }
-

@@ -1,189 +1,165 @@
 """
-ROCmForge Studio — AST-Based CUDA Primitive Classifier
+ROCmForge Studio — LLM-Based Semantic CUDA Primitive Classifier
 
-Deterministic, tree-sitter AST classifier that detects:
-  • GEMM (matmul patterns, cuBLAS calls)
-  • Reduction (sum, max, atomicAdd, warp-level reductions)
-  • Elementwise (pointwise / element-wise ops)
-  • Fused Matmul (GEMM + Activation)
+Replaces AST/regex classification with an LLM call that extracts
+mathematical intent and memory patterns from CUDA code.
+Falls back to 'unknown' if the LLM call fails.
 """
 
+import json
 import re
-from typing import Any, Dict, List, Optional
-import tree_sitter
-import tree_sitter_cpp
+from typing import Any, Dict
 
-# Initialize parser
-parser = tree_sitter.Parser(tree_sitter.Language(tree_sitter_cpp.language()))
+from openai import OpenAI
 
-# Fallback definitions
-_DTYPE_MAP = {
-    "half": "half", "__half": "half", "float16": "half", "fp16": "half",
-    "float": "float", "fp32": "float",
-    "double": "double", "fp64": "double",
-    "int": "int", "int32_t": "int"
+from app.config import GROQ_API_KEY, GROQ_MODEL, GROQ_BASE_URL
+
+
+_SYSTEM_PROMPT = (
+    "You are an abstract mathematician. Read this CUDA code. "
+    "Strip all hardware syntax. Return a JSON object defining the "
+    "mathematical intent and memory patterns. Schema: "
+    '{ "primitive": "gemm|reduction|elementwise|fused_matmul|softmax|layernorm|conv|attention|dropout|unknown", '
+    '"pattern": "string", '
+    '"memory_bound": boolean, '
+    '"shared_memory_used": boolean }. '
+    "Return ONLY the JSON object, no markdown fences, no explanation."
+)
+
+# Fallback dims by primitive
+_DEFAULT_DIMS: Dict[str, Dict[str, int]] = {
+    "gemm":        {"M": 1024, "N": 1024, "K": 1024},
+    "fused_matmul": {"M": 1024, "N": 1024, "K": 1024},
+    "reduction":   {"N": 1024},
+    "softmax":     {"N": 1024},
+    "layernorm":   {"N": 1024},
+    "conv":        {"N": 1024, "C": 64, "H": 32, "W": 32},
+    "attention":   {"N": 1024, "D": 64},
+    "dropout":     {"N": 1024},
+    "elementwise": {"N": 1024},
+    "unknown":     {"N": 1024},
 }
 
-def _traverse_ast(node, target_types=None, target_text=None, results=None):
-    """Recursively search AST for specific node types or source text matches."""
-    if results is None:
-        results = []
-    
-    match = True
-    if target_types and node.type not in target_types:
-        match = False
-    
-    if target_text and match:
-        # Extract source bytes if needed for text matching
-        text = node.text.decode('utf8')
-        if not re.search(target_text, text, re.IGNORECASE):
-            match = False
-            
-    if match and (target_types or target_text):
-         results.append(node)
+# Default pattern by primitive (must align with template_engine.TEMPLATE_MAP keys)
+_DEFAULT_PATTERN: Dict[str, str] = {
+    "gemm":        "tiled_shared",
+    "fused_matmul": "fused_relu",
+    "reduction":   "wavefront_reduce",
+    "softmax":     "fused_softmax_reduce",
+    "layernorm":   "fused_layernorm",
+    "conv":        "direct_conv",
+    "attention":   "flash_attention",
+    "dropout":     "fused_dropout",
+    "elementwise": "vectorized",
+    "unknown":     "unknown",
+}
 
-    for child in node.children:
-        _traverse_ast(child, target_types, target_text, results)
-        
-    return results
 
-def _detect_primitive_and_pattern_ast(code: str, root_node) -> tuple:
-    primitive = "elementwise"
-    pattern = "vectorized"
-    
-    # Check for library calls first
-    calls = _traverse_ast(root_node, target_types=["call_expression"])
-    for call in calls:
-        call_text = call.text.decode('utf8').lower()
-        if "cublas" in call_text or "rocblas" in call_text or "gemm" in call_text:
-            return "gemm", "tiled_shared"
-        elif "conv" in call_text or "cudnn" in call_text:
-            return "conv", "direct_conv"
-            
-    # Check memory access and syncthreads for patterns
-    shared_decls = _traverse_ast(root_node, target_text=r'\b(__shared__|shared)\b')
-    syncthreads = _traverse_ast(root_node, target_text=r'__syncthreads')
-    
-    # Check for loops (often indicates GEMM or Reduction)
-    for_loops = _traverse_ast(root_node, target_types=["for_statement"])
-    
-    # Check for atomics/shuffles (reduction)
-    shuffles = _traverse_ast(root_node, target_text=r'__shfl|warp_reduce|reduce')
-    atomics = _traverse_ast(root_node, target_text=r'atomicAdd|atomicMax')
-    
-    # Check for specific Math / Activations
-    activations = _traverse_ast(root_node, target_text=r'\brelu\b|\bsigmoid\b|>\s*0\s*\?')
-    exponents = _traverse_ast(root_node, target_text=r'\bexpf\b|\bexp\b')
-    sqrts = _traverse_ast(root_node, target_text=r'\brsqrtf\b|\bsqrt\b|\brsqrt\b')
-    rngs = _traverse_ast(root_node, target_text=r'\bseed\b|\brand\b')
-    
-    # Classify based on AST features
-    # 1. Attention (typically has exp/softmax + matrix traits)
-    if exponents and sum(1 for p in _traverse_ast(root_node, target_types=["parameter_declaration"]) if b'Q' in p.text or b'K' in p.text or b'V' in p.text) >= 2:
-        return "attention", "flash_attention"
-    
-    # 2. Softmax (typically has exp, reduce max, reduce sum)
-    elif exponents and shuffles and len(for_loops) >= 2:
-        return "softmax", "fused_softmax_reduce"
-        
-    # 3. LayerNorm (typically has rsqrt, mean/var reductions)
-    elif sqrts and len(for_loops) >= 2 and shuffles:
-        return "layernorm", "fused_layernorm"
-        
-    # 4. Conv (nested loops over kernel size)
-    elif len(for_loops) >= 4: # batch, channels, kernel_h, kernel_w
-        return "conv", "direct_conv"
-        
-    # 5. Dropout (RNG based element-wise mutator)
-    elif rngs and _traverse_ast(root_node, target_text=r'\bdrop\b'):
-        return "dropout", "fused_dropout"
-        
-    # 6. Fallback Standard Primitives
-    elif shuffles or atomics:
-        primitive = "reduction"
-        pattern = "wavefront_reduce" if shuffles else "atomic_reduce"
-    elif len(for_loops) >= 1 and (shared_decls or syncthreads or len(for_loops) >= 2):
-        if activations:
-            primitive = "fused_matmul"
-            pattern = "fused_relu"
-        else:
-            primitive = "gemm"
-            pattern = "tiled_shared" if shared_decls else "basic_gemm"
-    else:
-        # Elementwise
-        primitive = "elementwise"
-        vector_types = _traverse_ast(root_node, target_text=r'float4|float2|double2|int4')
-        pattern = "vectorized" if vector_types else "scalar"
-        
-    return primitive, pattern
+def _get_client() -> OpenAI:
+    """Create an OpenAI-compatible client pointing at Groq."""
+    return OpenAI(
+        api_key=GROQ_API_KEY,
+        base_url=GROQ_BASE_URL,
+    )
 
-def _extract_dims_ast(code: str, root_node) -> Dict[str, int]:
-    """Extract dimensions from basic assignments or params in AST."""
-    dims = {}
-    
-    # Check for parameter declarations that look like dimensions (M, N, K, size)
-    params = _traverse_ast(root_node, target_types=["parameter_declaration"])
-    
-    # Also fallback to regex for simple assignments since AST for unresolved C++ might be messy
-    dim_pattern = re.compile(r'(?:M|N|K|rows|cols|width|height|dim|size)\s*=\s*(\d+)', re.IGNORECASE)
+
+def _extract_dims_from_code(code: str) -> Dict[str, int]:
+    """Best-effort regex extraction of dimension literals from code."""
+    dims: Dict[str, int] = {}
+    dim_pattern = re.compile(
+        r'(?:M|N|K|rows|cols|width|height|dim|size)\s*=\s*(\d+)',
+        re.IGNORECASE,
+    )
     for m in dim_pattern.finditer(code):
         name = m.group(0).split("=")[0].strip().upper()
         dims[name] = int(m.group(1))
-        
     return dims
 
-def _detect_dtype_ast(root_node) -> str:
-    """Find primary floating/integer type in AST."""
-    types = _traverse_ast(root_node, target_types=["primitive_type", "type_identifier"])
-    
-    for t in types:
-        text = t.text.decode('utf8').lower()
-        if text in _DTYPE_MAP:
-            return _DTYPE_MAP[text]
-            
-    return "float"
+
+def _call_llm(cuda_code: str) -> Dict[str, Any]:
+    """
+    Call LLM to extract semantic primitives from CUDA code.
+    Returns parsed JSON dict or raises on failure.
+    """
+    client = _get_client()
+    response = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": cuda_code},
+        ],
+        temperature=0.0,
+        max_tokens=300,
+    )
+
+    raw = response.choices[0].message.content or ""
+    # Strip markdown fences if present
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```\w*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+        raw = raw.strip()
+
+    return json.loads(raw)
+
 
 def classify(code: str) -> Dict[str, Any]:
     """
-    Classify *code* as gemm / reduction / elementwise / fused_matmul.
+    Classify CUDA code by calling LLM for semantic extraction.
 
     Returns
     -------
     dict
-        primitive : str   — "gemm", "reduction", "elementwise", or "fused_matmul"
-        dtype     : str   — detected data type
-        shape     : str   — shape format (e.g. "M=1024, N=1024, K=1024")
-        pattern   : str   — detected semantic pattern
-        meta      : dict  — additional metadata (dims)
+        primitive          : str   — detected primitive type
+        dtype              : str   — "float" (default)
+        shape              : str   — shape string
+        pattern            : str   — detected semantic pattern
+        meta               : dict  — dims + pattern + LLM extraction result
+        semantic_extraction: dict  — raw LLM JSON output
     """
-    # Parse code into AST
-    tree = parser.parse(bytes(code, 'utf8'))
-    root = tree.root_node
-    
-    primitive, pattern = _detect_primitive_and_pattern_ast(code, root)
-    dtype = _detect_dtype_ast(root)
-    dims = _extract_dims_ast(code, root)
+    # Default fallback result
+    fallback_primitive = "unknown"
+    semantic_result: Dict[str, Any] = {}
 
-    # Fallback dims when none detected
+    try:
+        semantic_result = _call_llm(code)
+        primitive = semantic_result.get("primitive", fallback_primitive)
+        # Validate primitive value
+        valid_primitives = {
+            "gemm", "reduction", "elementwise", "fused_matmul",
+            "softmax", "layernorm", "conv", "attention", "dropout", "unknown",
+        }
+        if primitive not in valid_primitives:
+            primitive = fallback_primitive
+    except Exception:
+        primitive = fallback_primitive
+        semantic_result = {
+            "primitive": "unknown",
+            "pattern": "unknown",
+            "memory_bound": False,
+            "shared_memory_used": False,
+        }
+
+    # Use LLM-returned pattern or fall back to default
+    pattern = semantic_result.get("pattern")
+    if not pattern or pattern == "string":
+        pattern = _DEFAULT_PATTERN.get(primitive, "vectorized")
+
+    # Extract dimensions from code (best-effort regex fallback)
+    dims = _extract_dims_from_code(code)
     if not dims:
-        if primitive in ("gemm", "fused_matmul"):
-            dims = {"M": 1024, "N": 1024, "K": 1024}
-        elif primitive == "reduction":
-            dims = {"N": 1024}
-        else:
-            dims = {"N": 1024}
+        dims = _DEFAULT_DIMS.get(primitive, {"N": 1024}).copy()
 
     shape = ", ".join(f"{k}={v}" for k, v in dims.items())
 
     return {
         "primitive": primitive,
-        "dtype": dtype,
+        "dtype": "float",
         "shape": shape,
         "pattern": pattern,
         "meta": {
             "dims": dims,
-            "pattern": pattern
+            "pattern": pattern,
         },
+        "semantic_extraction": semantic_result,
     }
-
-
