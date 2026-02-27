@@ -143,6 +143,15 @@ async def generate_endpoint(
     backend = _detect()
 
     try:
+        # Guard: reject unknown/unrecognized primitives
+        if body.primitive == "unknown":
+            return APIResponse(
+                status="error",
+                data=None,
+                message="Cannot generate code: input was not recognized as valid CUDA code. Please provide a valid CUDA kernel.",
+                hardware_backend_used=backend,
+            )
+
         result = await asyncio.wait_for(
             asyncio.get_event_loop().run_in_executor(
                 None, _do_generate, body.primitive, body.meta
@@ -530,6 +539,12 @@ def _do_parse(cuda_code: str) -> dict:
 
 
 def _do_generate(primitive: str, meta: dict) -> dict:
+    # Safety net: never let 'unknown' reach the template engine
+    if primitive == "unknown":
+        raise ValueError(
+            "Cannot generate code for unknown primitive. "
+            "Input was not recognized as valid CUDA code."
+        )
     generated = template_engine.generate(primitive, meta)
     safety    = safety_engine.analyse(
         generated["rocm_code"],
